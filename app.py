@@ -18,7 +18,7 @@ st.set_page_config(page_title="PlotTwist — Sales Analytics Copilot", page_icon
 MODEL_NAME = "gemini-1.5-flash"
 
 
-RAW_XLSX_URL = "https://github.com/5av1t/PlotTwist/blob/47294643e5543c82c1cc3148b31547dfdd3b6f0f/sales_template.xlsx"
+RAW_XLSX_URL = "https://github.com/5av1t/PlotTwist/blob/c773fb15163ea3ec251819672eff5ba54cef4f03/sales_template.xlsx"
 
 # API key
 API_KEY = os.getenv("GOOGLE_API_KEY")
