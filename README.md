@@ -28,7 +28,8 @@ If the code errors? PlotTwist automatically asks Gemini to **repair** and reruns
 ├── sales_template.csv # Example CSV template
 ├── requirements.txt # Python dependencies
 └── README.md # Project documentation
-🧑‍💻 Usage
+
+## 🧑‍💻 Usage
 
 Upload your sales data file (.xlsx or .csv).
 
@@ -40,7 +41,7 @@ View results: tables + charts generated on the fly.
 
 If something breaks, the app auto-repairs the code and re-runs it.
 
-🛡️ Safety Features
+## 🛡️ Safety Features
 
 Sandboxed execution — Gemini code runs in a restricted environment
 
@@ -50,7 +51,7 @@ No file/network access for generated code
 
 Self-healing loop to fix errors automatically
 
-📊 Example Insights
+## 📊 Example Insights
 
 Monthly revenue trend line
 
@@ -62,7 +63,7 @@ Total revenue & average order value
 
 Forecasted sales for the next 6 months
 
-🌟 Roadmap
+## 🌟 Roadmap
 
  Option to share entire CSV if file is small
 
@@ -70,6 +71,6 @@ Forecasted sales for the next 6 months
 
  More chart templates (heatmaps, stacked bars, etc.)
 
-📜 License
+## 📜 License
 
 MIT License — feel free to use and adapt.
