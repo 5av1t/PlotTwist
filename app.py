@@ -17,6 +17,7 @@ st.set_page_config(page_title="PlotTwist — Sales Analytics Copilot", page_icon
 MODEL_NAME = "gemini-1.5-flash"
 FIG_W, FIG_H = 3.5, 2.4
 
+# Replace with your GitHub RAW URLs after upload
 RAW_XLSX_URL = "https://raw.githubusercontent.com/5av1t/plottwist/main/sales_template.xlsx"
 RAW_CSV_URL = "https://raw.githubusercontent.com/5av1t/plottwist/main/sales_template.csv"
 
@@ -51,18 +52,40 @@ def _sample_rows_json(df, n=3):
     if df.empty: return []
     return df.head(n).applymap(_to_jsonable).to_dict(orient="records")
 
+# ================== DATE-SAFE PLOTTING HELPERS ==================
+def plot_datetime(ax, x_like, y_vals, **kwargs):
+    """Plot with a guaranteed date x-axis to avoid categorical UnitData issues."""
+    xd = pd.to_datetime(x_like, errors="coerce")
+    xnum = mdates.date2num(pd.DatetimeIndex(xd).to_pydatetime())
+    line = ax.plot(xnum, np.asarray(y_vals, dtype=float), **kwargs)
+    ax.xaxis_date()
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+    return line
+
+def fill_between_datetime(ax, x_like, y1, y2, **kwargs):
+    xd = pd.to_datetime(x_like, errors="coerce")
+    xnum = mdates.date2num(pd.DatetimeIndex(xd).to_pydatetime())
+    ax.fill_between(xnum, np.asarray(y1, dtype=float), np.asarray(y2, dtype=float), **kwargs)
+    ax.xaxis_date()
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+
 # ================== LLM PROMPT ==================
 SYSTEM_PREAMBLE = """
 You are a Python data assistant. Output ONLY a Python code snippet (no backticks, no prose).
 
 Constraints:
 - DataFrame is preloaded as `df`.
-- Allowed: pandas as pd, numpy as np, matplotlib.pyplot as plt.
+- Allowed: pandas as pd, numpy as np, matplotlib.pyplot as plt, matplotlib.dates as mdates.
 - Forbidden: imports, file I/O, network, os/sys/subprocess/pathlib/socket/pickle/tempfile, input(), exec/eval/compile, __import__.
-- For forecasting, you already have ExponentialSmoothing, LinearRegression, datetime.
+- For forecasting/analytics, you already have: ExponentialSmoothing, LinearRegression, datetime.
 - Do NOT import these, just use them directly.
-- Assign tables to `result_df`, charts to `fig = plt.gcf()`.
-- Prefer trend-only ExponentialSmoothing unless ≥24 months of data.
+- If you produce a table, assign to `result_df`.
+- If you produce a chart, assign to `fig = plt.gcf()`.
+
+Time-series plotting rules (MUST follow to avoid crashes):
+- Always use the provided helpers `plot_datetime(ax, x, y)` and `fill_between_datetime(ax, x, y1, y2)` for any date x-axis.
+- Do not pass string dates directly to matplotlib/pandas `.plot(...)`.
+- Prefer trend-only ExponentialSmoothing unless the dataset has ≥24 months for seasonality.
 - Keep code under 120 lines.
 """
 
@@ -87,7 +110,7 @@ def llm_generate_code(user_instruction, df):
     except Exception as e:
         return f"# ERROR calling Google AI: {e}\nresult_df = df.head(5)"
 
-# ================== UPLOAD READER ==================
+# ================== UPLOAD READER (robust for mobile) ==================
 def read_any_table(uploaded):
     if uploaded is None:
         raise ValueError("No file provided")
@@ -113,6 +136,7 @@ def read_any_table(uploaded):
 # ================== SANDBOX ==================
 IMPORT_LINE_RE = re.compile(r'^\s*(?:from\s+\S+\s+import\s+.*|import\s+.+)$')
 CONTINUATION_RE = re.compile(r'.*\\\s*$')
+
 def sanitize_code(snippet):
     if not isinstance(snippet, str): return ""
     code = snippet.strip()
@@ -120,7 +144,7 @@ def sanitize_code(snippet):
         code = "\n".join(ln for ln in code.splitlines() if not ln.strip().startswith("```") and not ln.strip().startswith("python"))
     cleaned, skip = [], False
     for ln in code.splitlines():
-        if skip: 
+        if skip:
             if CONTINUATION_RE.match(ln): continue
             else: skip = False; continue
         if IMPORT_LINE_RE.match(ln):
@@ -160,11 +184,19 @@ def run_snippet(snippet, df):
     cleaned = sanitize_code(snippet)
     ok, err = validate_snippet(cleaned)
     if not ok: return None, None, f"Validation failed: {err}"
-    safe_globals = {"pd": pd, "np": np, "plt": plt,
+
+    # Safe globals that LLM code can use
+    safe_globals = {
+        "pd": pd, "np": np, "plt": plt, "mdates": mdates,
         "ExponentialSmoothing": ExponentialSmoothing,
         "LinearRegression": LinearRegression,
-        "datetime": datetime}
+        "datetime": datetime,
+        # expose date-safe helpers to LLM
+        "plot_datetime": plot_datetime,
+        "fill_between_datetime": fill_between_datetime,
+    }
     safe_locals = {"df": df.copy()}
+
     try:
         exec(cleaned, safe_globals, safe_locals)
         result_df = safe_locals.get("result_df")
@@ -177,16 +209,21 @@ def run_snippet(snippet, df):
 # ================== AUTO-INSIGHTS HELPERS ==================
 def ensure_dates_and_revenue(df):
     out = df.copy()
-    if "OrderDate" in out.columns: out["OrderDate"] = pd.to_datetime(out["OrderDate"], errors="coerce")
-    elif "Date" in out.columns: out["OrderDate"] = pd.to_datetime(out["Date"], errors="coerce")
+    if "OrderDate" in out.columns:
+        out["OrderDate"] = pd.to_datetime(out["OrderDate"], errors="coerce")
+    elif "Date" in out.columns:
+        out["OrderDate"] = pd.to_datetime(out["Date"], errors="coerce")
     else:
         for c in out.columns:
-            try: out["OrderDate"] = pd.to_datetime(out[c], errors="raise"); break
-            except Exception: continue
+            try:
+                out["OrderDate"] = pd.to_datetime(out[c], errors="raise"); break
+            except Exception:
+                continue
     if "Revenue" not in out.columns:
         if {"Quantity","UnitPrice"}.issubset(out.columns):
             out["Revenue"] = pd.to_numeric(out["Quantity"], errors="coerce") * pd.to_numeric(out["UnitPrice"], errors="coerce")
-        else: out["Revenue"] = np.nan
+        else:
+            out["Revenue"] = np.nan
     return out
 
 def monthly_revenue(df):
@@ -203,12 +240,14 @@ with st.sidebar:
         rx = requests.get(RAW_XLSX_URL, timeout=8); rx.raise_for_status()
         st.download_button("Excel (.xlsx)", data=rx.content, file_name="sales_template.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    except Exception: st.warning("Excel template not available")
+    except Exception:
+        st.warning("Excel template not available")
 
     try:
         rc = requests.get(RAW_CSV_URL, timeout=8); rc.raise_for_status()
         st.download_button("CSV (.csv)", data=rc.content, file_name="sales_template.csv", mime="text/csv")
-    except Exception: st.warning("CSV template not available")
+    except Exception:
+        st.warning("CSV template not available")
 
 # ================== MAIN UI ==================
 st.title("📊 PlotTwist — Sales Analytics Copilot")
@@ -230,7 +269,8 @@ if df2 is not None:
     default_prompt = (
         "Summarize the dataset with 1) monthly revenue trend (compact line), "
         "2) top 5 customers (bar), 3) total revenue + avg order value table, "
-        "and if >=24 months, forecast next 6 months with ExponentialSmoothing."
+        "and if >=24 months, forecast next 6 months with ExponentialSmoothing. "
+        "For any date x-axis, use plot_datetime(ax, x, y) and fill_between_datetime(ax, x, y1, y2)."
     )
     if "ran_auto" not in st.session_state: st.session_state["ran_auto"] = False
     user_prompt = st.text_area("Your prompt", value=st.session_state.get("last_prompt", default_prompt), height=90)
@@ -249,7 +289,7 @@ if df2 is not None:
             if fig is not None: st.pyplot(fig, use_container_width=False, clear_figure=True)
         st.session_state["ran_auto"] = True
 
-    # ===== Forecast Preview (safe for mobile) =====
+    # ===== Forecast Preview (date-safe) =====
     mrev = monthly_revenue(df2)
     if len(mrev) >= 12:
         st.markdown("### 🔮 Forecast Preview")
@@ -264,19 +304,16 @@ if df2 is not None:
         else:
             model = ExponentialSmoothing(y, trend="add").fit()
             label = "ETS Additive (trend-only)"
+
         fcast = model.forecast(6)
         resid = y - model.fittedvalues.reindex(y.index).bfill()
         resid_std = float(np.nanstd(resid))
         fcast.index = pd.date_range(start=mrev.index[-1] + pd.offsets.MonthBegin(1), periods=6, freq="MS")
 
         figF, axF = plt.subplots(figsize=(FIG_W+0.7, FIG_H))
-        hist_x = mdates.date2num(mrev.index.to_pydatetime())
-        fcast_x = mdates.date2num(fcast.index.to_pydatetime())
-        axF.plot(hist_x, y.values, label="History")
-        axF.plot(fcast_x, fcast.values, linestyle="--", label="Forecast")
-        axF.fill_between(fcast_x, (fcast - 1.96*resid_std).values, (fcast + 1.96*resid_std).values, alpha=0.2)
-        axF.xaxis_date(); axF.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
-        figF.autofmt_xdate()
+        plot_datetime(axF, mrev.index, y.values, label="History")
+        plot_datetime(axF, fcast.index, fcast.values, linestyle="--", label="Forecast")
+        fill_between_datetime(axF, fcast.index, (fcast - 1.96*resid_std).values, (fcast + 1.96*resid_std).values, alpha=0.2)
         axF.set_title("Revenue Forecast (6 mo)", fontsize=10, pad=6)
         axF.set_ylabel("Revenue"); axF.grid(alpha=0.2); axF.legend(fontsize=8)
         figF.tight_layout()
