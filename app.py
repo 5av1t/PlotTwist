@@ -1,4 +1,4 @@
-import os, io, json, ast, traceback
+import os, io, json, ast, traceback, re
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import google.generativeai as genai
 import requests
 
-# Forecasting / analytics helpers
+# Forecasting / analytics helpers (preloaded, so no imports needed in LLM code)
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from sklearn.linear_model import LinearRegression
 import datetime
@@ -20,7 +20,7 @@ MODEL_NAME = "gemini-1.5-flash"
 
 RAW_XLSX_URL = "https://github.com/5av1t/PlotTwist/blob/47294643e5543c82c1cc3148b31547dfdd3b6f0f/sales_template.xlsx"
 
-# API key setup
+# API key
 API_KEY = os.getenv("GOOGLE_API_KEY")
 if "GOOGLE_API_KEY" in st.secrets:
     API_KEY = st.secrets["GOOGLE_API_KEY"]
@@ -72,10 +72,45 @@ def llm_generate_code(user_instruction: str, df: pd.DataFrame) -> str:
     except Exception as e:
         return f"# ERROR calling Google AI: {e}\nresult_df = df.head(5)"
 
-# ================== SANDBOX ==================
+# ================== CODE SANITIZER & SANDBOX ==================
+# 1) Strip any import statements the LLM may add anyway
+IMPORT_LINE_RE = re.compile(r'^\s*(?:from\s+\S+\s+import\s+.*|import\s+.+)$')
+CONTINUATION_RE = re.compile(r'.*\\\s*$')  # handle "from x import y, \\" continued lines
+
+def sanitize_code(snippet: str) -> str:
+    if not isinstance(snippet, str):
+        return ""
+    # Remove fenced code markers
+    code = snippet.strip()
+    if code.startswith("```"):
+        code = "\n".join(
+            ln for ln in code.splitlines()
+            if not ln.strip().startswith("```") and not ln.strip().startswith("python")
+        )
+    # First pass: drop all pure import lines
+    cleaned_lines = []
+    skip_cont = False
+    for ln in code.splitlines():
+        if skip_cont:
+            # keep skipping continuation lines of an import block
+            if CONTINUATION_RE.match(ln):
+                continue
+            else:
+                skip_cont = False
+                continue
+        if IMPORT_LINE_RE.match(ln):
+            # if it ends with "\" then subsequent line continues the import statement
+            if CONTINUATION_RE.match(ln):
+                skip_cont = True
+            continue
+        cleaned_lines.append(ln)
+    cleaned = "\n".join(cleaned_lines)
+    return cleaned
+
+# 2) Guardrails (still block dangerous ops / modules / dunders)
 FORBIDDEN_CALLS = {"open","exec","eval","compile","__import__","input","system"}
 FORBIDDEN_ATTR_ROOTS = {"os","sys","subprocess","pathlib","socket","requests","shutil","pickle","dill","tempfile","builtins","importlib"}
-FORBIDDEN_NODES = (ast.Import, ast.ImportFrom)
+FORBIDDEN_NODES = (ast.Import, ast.ImportFrom)  # should be gone after sanitize, but double-check
 DISALLOWED_ATTR_NAMES = {"__dict__","__class__","__mro__","__subclasses__","__globals__","__getattribute__","__getattr__"}
 
 def validate_snippet(snippet: str):
@@ -109,7 +144,9 @@ def validate_snippet(snippet: str):
     return True, None
 
 def run_snippet(snippet: str, df: pd.DataFrame):
-    ok, err = validate_snippet(snippet)
+    # sanitize first (remove imports), then validate & execute
+    cleaned = sanitize_code(snippet)
+    ok, err = validate_snippet(cleaned)
     if not ok:
         return None, None, f"Validation failed: {err}"
     safe_globals = {
@@ -119,19 +156,13 @@ def run_snippet(snippet: str, df: pd.DataFrame):
         "datetime": datetime
     }
     safe_locals = {"df": df.copy()}
-    code = snippet.strip()
-    if code.startswith("```"):
-        code = "\n".join(
-            ln for ln in code.splitlines()
-            if not ln.strip().startswith("```") and not ln.strip().startswith("python")
-        )
     try:
-        exec(code, safe_globals, safe_locals)
+        exec(cleaned, safe_globals, safe_locals)
         result_df = safe_locals.get("result_df")
         fig = safe_locals.get("fig", plt.gcf())
         if fig and not fig.axes:
             fig = None
-        return result_df, fig, "Executed successfully."
+        return result_df, fig, "Executed successfully (imports stripped)."
     except Exception as e:
         return None, None, "Execution error:\n" + "".join(traceback.format_exception_only(type(e), e))
 
@@ -199,15 +230,22 @@ if file:
 
 if df is not None:
     st.markdown("### Ask a question")
-    user_prompt=st.text_area("Examples: 'Monthly revenue trend', 'Forecast next 6 months of sales with ExponentialSmoothing'",height=80)
+    user_prompt=st.text_area(
+        "Examples:\n- Monthly revenue trend\n- Forecast next 6 months of revenue with ExponentialSmoothing\n- Top 10 customers by revenue (bar chart)\n- Regression: predict Revenue from Quantity",
+        height=110
+    )
     if st.button("Generate & Run",type="primary"):
-        with st.spinner("Asking Gemini…"): code=llm_generate_code(user_prompt,df)
-        st.subheader("Generated code"); st.code(code or "# empty",language="python")
+        with st.spinner("Asking Gemini…"):
+            code=llm_generate_code(user_prompt,df)
+        st.subheader("Sanitized code (imports auto-removed)")
+        st.code(sanitize_code(code) if code else "# empty",language="python")
         if code and not code.strip().startswith("# ERROR"):
             with st.spinner("Executing safely…"):
                 result_df,fig,logs=run_snippet(code,df)
             st.markdown(f"**Logs:** {logs}")
-            if isinstance(result_df,pd.DataFrame): st.subheader("Result table"); st.dataframe(result_df,use_container_width=True)
-            if fig is not None: st.subheader("Chart"); st.pyplot(fig,clear_figure=True)
+            if isinstance(result_df,pd.DataFrame):
+                st.subheader("Result table"); st.dataframe(result_df,use_container_width=True)
+            if fig is not None:
+                st.subheader("Chart"); st.pyplot(fig,clear_figure=True)
 else:
     st.info("💡 Tip: download the Excel template from the sidebar and try prompts right away.")
