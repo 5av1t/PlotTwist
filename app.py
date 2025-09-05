@@ -17,8 +17,8 @@ MODEL_NAME = "gemini-1.5-flash"
 FIG_W, FIG_H = 3.5, 2.4
 
 # Template file URLs (replace with your GitHub RAW URLs after upload)
-RAW_XLSX_URL = "https://raw.githubusercontent.com/Sav1t/plottwist/main/sales_template.xlsx"
-RAW_CSV_URL = "https://raw.githubusercontent.com/Sav1t/plottwist/main/sales_template.csv"
+RAW_XLSX_URL = "https://raw.githubusercontent.com/5av1t/plottwist/main/sales_template.xlsx"
+RAW_CSV_URL = "https://raw.githubusercontent.com/5av1t/plottwist/main/sales_template.csv"
 
 API_KEY = os.getenv("GOOGLE_API_KEY")
 if "GOOGLE_API_KEY" in st.secrets:
