@@ -1,4 +1,4 @@
-import os, json, ast, traceback
+import os, io, json, ast, traceback
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,30 +6,29 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import google.generativeai as genai
-import requests  # used only to fetch the template CSV from GitHub
+import requests
 
-# -------------------- CONFIG --------------------
-st.set_page_config(page_title="PlotTwist — Data Copilot", page_icon="📊", layout="wide")
+# ================== APP CONFIG ==================
+st.set_page_config(page_title="PlotTwist — Excel Edition", page_icon="📊", layout="wide")
 MODEL_NAME = "gemini-1.5-flash"
 
-# 🔴 TODO: replace this with YOUR GitHub raw CSV URL after you upload sales_template.csv
-# Example: https://raw.githubusercontent.com/<user>/<repo>/main/sales_template.csv
-RAW_CSV_URL = "https://github.com/5av1t/PlotTwist/blob/22a33b0d4ea89b3b7ba5b60d6bce471976933853/sales_template.csv"
 
-# API key: Streamlit Cloud -> Settings -> Secrets
+RAW_XLSX_URL = "https://github.com/5av1t/PlotTwist/blob/407f9cafee5a445fb0b0cd06f56146724fc9b1c8/sales_template.xlsx"
+
+# Google AI API key (Streamlit Cloud → Settings → Secrets or environment variable)
 API_KEY = os.getenv("GOOGLE_API_KEY")
 if "GOOGLE_API_KEY" in st.secrets:
     API_KEY = st.secrets["GOOGLE_API_KEY"]
 if API_KEY:
     genai.configure(api_key=API_KEY)
 
-# -------------------- LLM PROMPT --------------------
+# ================== LLM PROMPT ==================
 SYSTEM_PREAMBLE = """
 You are a Python data assistant. Output ONLY a Python code snippet (no backticks, no prose).
 Constraints:
 - A pandas DataFrame named `df` is already loaded with the user's data.
 - Allowed libraries: pandas as pd, numpy as np, matplotlib.pyplot as plt.
-- Forbidden: imports, file I/O, network, os/sys/subprocess/pathlib/socket/pickle, input(), exec/eval.
+- Forbidden: imports, file I/O, network, os/sys/subprocess/pathlib/socket/pickle, input(), exec/eval/compile.
 - If you produce a table, assign it to variable `result_df`.
 - If you produce a chart, assign the figure to variable `fig` (e.g., fig = plt.gcf()).
 - Do not modify global state. Keep code under 120 lines.
@@ -55,6 +54,7 @@ def llm_generate_code(user_instruction: str, df: pd.DataFrame) -> str:
         model = genai.GenerativeModel(MODEL_NAME)
         resp = model.generate_content(prompt)
         text = (resp.text or "").strip()
+        # Strip code fences if any
         if text.startswith("```"):
             lines = [ln for ln in text.splitlines() if not ln.strip().startswith("```") and not ln.strip().startswith("python")]
             text = "\n".join(lines).strip()
@@ -62,7 +62,7 @@ def llm_generate_code(user_instruction: str, df: pd.DataFrame) -> str:
     except Exception as e:
         return f"# ERROR calling Google AI: {e}\nresult_df = df.head(5)"
 
-# -------------------- SANDBOX --------------------
+# ================== SANDBOX ==================
 FORBIDDEN_CALLS = {"open","exec","eval","compile","__import__","input","system","popen","spawn","fork","kill"}
 FORBIDDEN_ATTR_ROOTS = {"os","sys","subprocess","pathlib","socket","requests","shutil","pickle","dill"}
 FORBIDDEN_NODES = (ast.Import, ast.ImportFrom, ast.With, ast.Global, ast.Nonlocal, ast.Try, ast.AsyncFunctionDef)
@@ -104,7 +104,7 @@ def run_snippet(snippet: str, df: pd.DataFrame):
             if not ln.strip().startswith("```") and not ln.strip().startswith("python")
         )
     try:
-        exec(code, safe_globals, safe_locals)  # sandboxed globals/locals
+        exec(code, safe_globals, safe_locals)  # runs in restricted globals/locals
         result_df = safe_locals.get("result_df")
         fig = safe_locals.get("fig", plt.gcf())
         if fig and not fig.axes:
@@ -113,55 +113,95 @@ def run_snippet(snippet: str, df: pd.DataFrame):
     except Exception as e:
         return None, None, "Execution error:\n" + "".join(traceback.format_exception_only(type(e), e))
 
-# -------------------- SIDEBAR: DOWNLOAD TEMPLATE --------------------
+# ================== TEMPLATE (FALLBACK) ==================
+TEMPLATE_COLUMNS = [
+    "OrderID", "OrderDate", "Week", "Customer", "Product",
+    "Category", "Region", "Quantity", "UnitPrice", "Revenue"
+]
+
+def build_fallback_template_df() -> pd.DataFrame:
+    # 12 months of data (2024), multiple rows per month
+    rows = []
+    order_id = 30001
+    customers = ["Acme Corp", "Beta LLC", "Delta Inc", "Echo Ltd"]
+    products  = [("Widget A", "Widgets", 15), ("Widget B", "Widgets", 19), ("Gizmo X", "Gizmos", 45), ("Gizmo Y", "Gizmos", 60)]
+    regions   = ["North", "South", "East", "West"]
+    # Generate 3 records per month
+    for m in range(1, 13):
+        for i in range(3):
+            cust = customers[(m + i) % len(customers)]
+            prod, cat, price = products[(m + i) % len(products)]
+            reg = regions[(m + i) % len(regions)]
+            qty = 5 + ((m + i) % 20)
+            date = pd.Timestamp(year=2024, month=m, day=min(5 + i*7, 28))
+            revenue = qty * price
+            rows.append([order_id, date.date().isoformat(), int(date.weekofyear if hasattr(date, "weekofyear") else date.isocalendar()[1]),
+                         cust, prod, cat, reg, qty, float(price), float(revenue)])
+            order_id += 1
+    df = pd.DataFrame(rows, columns=TEMPLATE_COLUMNS)
+    return df
+
+def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sales") -> bytes:
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name=sheet_name)
+    buf.seek(0)
+    return buf.read()
+
+# ================== SIDEBAR: DOWNLOAD EXCEL TEMPLATE ==================
 with st.sidebar:
-    st.header("⬇️ Download Sales Template (CSV)")
-    st.caption("Clean, one-year dataset for testing. Upload it back below or use your own.")
-    # Try to fetch the raw CSV from GitHub; fall back to a tiny built-in sample if URL not set/can't fetch
-    csv_bytes, fetch_err = None, None
-    if RAW_CSV_URL.startswith("http"):
+    st.header("⬇️ Download Sales Template (Excel)")
+    st.caption("At least one year of dummy sales data. Upload it back below or use your own file.")
+
+    xlsx_bytes, fetch_err = None, None
+    if RAW_XLSX_URL.startswith("http"):
         try:
-            r = requests.get(RAW_CSV_URL, timeout=10)
+            r = requests.get(RAW_XLSX_URL, timeout=12)
             r.raise_for_status()
-            csv_bytes = r.content
+            xlsx_bytes = r.content
         except Exception as e:
             fetch_err = str(e)
-    if csv_bytes:
+
+    if xlsx_bytes:
         st.download_button(
-            label="Download sales_template.csv",
-            data=csv_bytes,
-            file_name="sales_template.csv",
-            mime="text/csv"
+            label="Download sales_template.xlsx",
+            data=xlsx_bytes,
+            file_name="sales_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     else:
-        st.warning("Template URL not reachable. Set a valid RAW GitHub URL in app.py.")
-        fallback = (
-            "OrderID,OrderDate,Week,Customer,Product,Category,Region,Quantity,UnitPrice,Revenue\n"
-            "20001,2024-01-05,1,Acme Corp,Widget A,Widgets,North,12,15,180\n"
-            "20002,2024-02-05,6,Beta LLC,Gizmo X,Gizmos,East,8,45,360\n"
+        if RAW_XLSX_URL.startswith("http"):
+            st.warning("Couldn’t fetch template from GitHub (check RAW_XLSX_URL). Using fallback template.")
+        fallback_df = build_fallback_template_df()
+        fallback_bytes = dataframe_to_excel_bytes(fallback_df)
+        st.download_button(
+            label="Download fallback_template.xlsx",
+            data=fallback_bytes,
+            file_name="fallback_template.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-        st.download_button("Download minimal_template.csv", data=fallback, file_name="minimal_template.csv", mime="text/csv")
 
-# -------------------- MAIN UI --------------------
-st.title("📊 PlotTwist — Data Copilot (Gemini)")
-st.caption("Upload CSV/XLSX → Ask in plain English → Gemini writes pandas/matplotlib → Safe execute → Table/Chart.")
+# ================== MAIN UI ==================
+st.title("📊 PlotTwist — Excel Edition (Gemini)")
+st.caption("Upload .xlsx (or .csv if you must) → Ask in plain English → Gemini writes pandas/matplotlib → Safe execute → Table/Chart.")
 
-# Upload + preview
-file = st.file_uploader("Upload your sales CSV/XLSX", type=["csv","xlsx"])
+file = st.file_uploader("Upload your sales file (.xlsx preferred; .csv also accepted)", type=["xlsx","csv"])
 df = None
+
 if file:
     try:
-        if file.name.lower().endswith(".csv"):
-            df = pd.read_csv(file)
+        if file.name.lower().endswith(".xlsx"):
+            # Robust Excel read
+            df = pd.read_excel(file, engine="openpyxl")
         else:
-            import openpyxl  # ensure installed; used by pandas for .xlsx
-            df = pd.read_excel(file)
+            # CSV fallback with resilient parsing
+            df = pd.read_csv(file, on_bad_lines="skip")
         st.success(f"Loaded {len(df):,} rows × {len(df.columns)} columns")
-        st.dataframe(df.head(50), use_container_width=True)
+        with st.expander("Preview data (first 50 rows)"):
+            st.dataframe(df.head(50), use_container_width=True)
     except Exception as e:
         st.error(f"Failed to read file: {e}")
 
-# Prompt → code → run
 if df is not None:
     st.markdown("### Ask for a summary or chart")
     user_prompt = st.text_area(
@@ -184,4 +224,4 @@ if df is not None:
                 st.subheader("Chart")
                 st.pyplot(fig, clear_figure=True)
 else:
-    st.info("Tip: download the template from the left sidebar, then upload it here to try prompts immediately.")
+    st.info("Tip: download the Excel template from the left sidebar, then upload it here to try prompts immediately.")
