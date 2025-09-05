@@ -14,7 +14,7 @@ MODEL_NAME = "gemini-1.5-flash"
 
 # 🔴 TODO: replace this with YOUR GitHub raw CSV URL after you upload sales_template.csv
 # Example: https://raw.githubusercontent.com/<user>/<repo>/main/sales_template.csv
-RAW_CSV_URL = "https://raw.githubusercontent.com/<user>/<repo>/main/sales_template.csv"
+RAW_CSV_URL = "https://github.com/5av1t/PlotTwist/blob/22a33b0d4ea89b3b7ba5b60d6bce471976933853/sales_template.csv"
 
 # API key: Streamlit Cloud -> Settings -> Secrets
 API_KEY = os.getenv("GOOGLE_API_KEY")
