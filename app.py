@@ -11,6 +11,7 @@ import requests
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from sklearn.linear_model import LinearRegression
 import datetime
+from datetime import timedelta
 
 # ================== CONFIG ==================
 st.set_page_config(page_title="PlotTwist — Sales Analytics Copilot", page_icon="📊", layout="wide")
