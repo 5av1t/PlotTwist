@@ -8,7 +8,7 @@ import matplotlib.pyplot as plt
 import google.generativeai as genai
 import requests
 
-# Forecasting / analytics helpers (preloaded for LLM code)
+# Forecasting / analytics helpers available to LLM code (preloaded; LLM must not import them)
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from sklearn.linear_model import LinearRegression
 import datetime
@@ -16,13 +16,35 @@ import datetime
 # ================== APP CONFIG ==================
 st.set_page_config(page_title="PlotTwist — Sales Analytics Copilot", page_icon="📊", layout="wide")
 MODEL_NAME = "gemini-1.5-flash"
-RAW_XLSX_URL = "https://github.com/5av1t/PlotTwist/blob/b10bf12045e5a2e29db17b55c3d9cb6499b3727f/sales_template.xlsx"  # <-- set your raw GitHub URL
+RAW_XLSX_URL = "https://github.com/5av1t/PlotTwist/blob/b10bf12045e5a2e29db17b55c3d9cb6499b3727f/sales_template.xlsx"  
+
+# Unified chart size (smaller & consistent)
+FIG_W = 5.5
+FIG_H = 3.2
 
 API_KEY = os.getenv("GOOGLE_API_KEY")
 if "GOOGLE_API_KEY" in st.secrets:
     API_KEY = st.secrets["GOOGLE_API_KEY"]
 if API_KEY:
     genai.configure(api_key=API_KEY)
+
+# ---------- Helpers: formatting ----------
+def fmt_currency(x):  # compact currency
+    try:
+        x = float(x)
+    except Exception:
+        return "—"
+    if abs(x) >= 1_000_000:
+        return f"${x/1_000_000:.1f}M"
+    if abs(x) >= 1_000:
+        return f"${x/1_000:.1f}K"
+    return f"${x:,.0f}"
+
+def fmt_percent(x):
+    try:
+        return f"{float(x):.1f}%"
+    except Exception:
+        return "—"
 
 # ---------- JSON SAFE SERIALIZER ----------
 def _to_jsonable(x):
@@ -214,20 +236,19 @@ with st.sidebar:
         st.download_button("Download fallback_template.xlsx",data=fallback,file_name="fallback_template.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# ================== HELPERS: AUTO INSIGHTS ==================
+# ================== AUTO-INSIGHTS HELPERS ==================
 def ensure_dates_and_revenue(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    # Date column
     if "OrderDate" in out.columns:
         out["OrderDate"] = pd.to_datetime(out["OrderDate"], errors="coerce")
     elif "Date" in out.columns:
         out["OrderDate"] = pd.to_datetime(out["Date"], errors="coerce")
     else:
-        # try best-effort: find first datetime-like column
         for c in out.columns:
             try:
                 cand = pd.to_datetime(out[c], errors="raise")
-                out["OrderDate"] = cand
-                break
+                out["OrderDate"] = cand; break
             except Exception:
                 continue
         if "OrderDate" not in out.columns:
@@ -244,7 +265,6 @@ def kpis(df: pd.DataFrame):
     total_rev = pd.to_numeric(df["Revenue"], errors="coerce").sum(skipna=True)
     orders = len(df)
     aov = (total_rev / orders) if orders else 0.0
-    # Top customer/product
     top_cust = df.groupby("Customer")["Revenue"].sum().sort_values(ascending=False).head(1)
     top_prod = df.groupby("Product")["Revenue"].sum().sort_values(ascending=False).head(1)
     return {
@@ -265,8 +285,8 @@ def yoy_growth(mrev: pd.DataFrame) -> float | None:
     if prev12 == 0: return None
     return float((last12 - prev12) / prev12 * 100.0)
 
-def quick_forecast_plot(mrev: pd.DataFrame, ax) -> str:
-    # If enough history, try seasonal; else trend-only
+def quick_forecast(mrev: pd.DataFrame, horizon=6):
+    """Returns (forecast_series, model_label, resid_std)"""
     y = mrev["Revenue"].astype(float)
     label = ""
     if len(mrev) >= 24:
@@ -279,18 +299,17 @@ def quick_forecast_plot(mrev: pd.DataFrame, ax) -> str:
     else:
         model = ExponentialSmoothing(y, trend="add").fit()
         label = "ETS Additive (trend-only)"
-    fcast = model.forecast(6)
-    mrev["Revenue"].plot(ax=ax)
-    fcast.index = pd.date_range(start=mrev.index[-1] + pd.offsets.MonthBegin(1), periods=6, freq="MS")
-    fcast.plot(ax=ax, linestyle="--")
-    ax.set_title("Revenue Forecast (next 6 months)")
-    ax.set_ylabel("Revenue")
-    ax.legend(["History", "Forecast"])
-    return label
+    fcast = model.forecast(horizon)
+    # crude PI using residual std dev
+    resid = y - model.fittedvalues.reindex(y.index).fillna(method="bfill")
+    resid_std = float(np.nanstd(resid))
+    idx = pd.date_range(start=mrev.index[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
+    fcast.index = idx
+    return fcast, label, resid_std
 
 # ================== MAIN UI ==================
 st.title("📊 PlotTwist — Sales Analytics Copilot")
-st.caption("Upload Excel → Instant insights + charts → Click a prompt chip or ask your own → Gemini generates code → Safe run.")
+st.caption("Upload Excel → Instant insights + tidy charts → Click a prompt chip or ask your own → Gemini generates code → Safe run.")
 
 file = st.file_uploader("Upload sales file (.xlsx preferred, .csv accepted)", type=["xlsx","csv"])
 df = None
@@ -301,61 +320,95 @@ if file:
         else:
             df = pd.read_csv(file, on_bad_lines="skip")
         st.success(f"Loaded {len(df):,} rows × {len(df.columns)} cols")
-        st.dataframe(df.head(50), use_container_width=True)
+        st.dataframe(df.head(30), use_container_width=True)
     except Exception as e:
         st.error(f"Failed to read file: {e}")
 
-# ======= WOW MOMENT: Auto KPIs + Charts + Forecast preview =======
+# ======= WOW MOMENT: Compact KPIs + Narrative + Smaller Charts =======
 if df is not None:
     df2 = ensure_dates_and_revenue(df)
     mrev = monthly_revenue(df2)
 
-    # KPI cards
-    c1, c2, c3, c4, c5 = st.columns(5)
+    # KPI cards (compact & formatted)
+    c1, c2, c3, c4, c5 = st.columns([1,1,1,1,1])
     k = kpis(df2)
-    c1.metric("Total Revenue", f"{k['total_revenue']:,.0f}")
-    c2.metric("Avg Order Value", f"{k['aov']:,.2f}")
-    c3.metric("Top Customer", f"{k['top_customer'][0]}", f"{k['top_customer'][1]:,.0f}")
-    c4.metric("Top Product", f"{k['top_product'][0]}", f"{k['top_product'][1]:,.0f}")
+    c1.metric("Total Revenue", fmt_currency(k['total_revenue']))
+    c2.metric("Avg Order Value", fmt_currency(k['aov']))
+    c3.metric("Top Customer", k['top_customer'][0], fmt_currency(k['top_customer'][1]))
+    c4.metric("Top Product", k['top_product'][0], fmt_currency(k['top_product'][1]))
     yg = yoy_growth(mrev)
-    c5.metric("YoY Growth (L12 vs P12)", f"{yg:.1f}%" if yg is not None else "—")
+    c5.metric("YoY Growth (L12 vs P12)", fmt_percent(yg) if yg is not None else "—")
 
+    # Narrative summary
+    st.markdown(
+        f"**Summary:** In the latest period, total revenue is **{fmt_currency(k['total_revenue'])}** "
+        f"with an average order value of **{fmt_currency(k['aov'])}**. "
+        f"Top customer is **{k['top_customer'][0]}** and top product is **{k['top_product'][0]}**."
+        + (f" Year-over-year growth is **{fmt_percent(yg)}**." if yg is not None else "")
+    )
+
+    # Chart grid — smaller figures, tidy layout
     st.markdown("### Quick Charts")
     colA, colB = st.columns(2)
     with colA:
-        fig1, ax1 = plt.subplots()
+        fig1, ax1 = plt.subplots(figsize=(FIG_W, FIG_H))
         if not mrev.empty:
             mrev.plot(ax=ax1, legend=False)
-            ax1.set_title("Monthly Revenue")
+            ax1.set_title("Monthly Revenue", fontsize=14, pad=8)
             ax1.set_ylabel("Revenue")
+            ax1.grid(alpha=0.2)
+        fig1.tight_layout()
         st.pyplot(fig1, clear_figure=True)
 
     with colB:
-        fig2, ax2 = plt.subplots()
+        fig2, ax2 = plt.subplots(figsize=(FIG_W, FIG_H))
         if "Customer" in df2.columns:
             top_c = df2.groupby("Customer")["Revenue"].sum().sort_values(ascending=False).head(5)
             top_c.plot.bar(ax=ax2)
-            ax2.set_title("Top 5 Customers by Revenue")
-            ax2.set_ylabel("Revenue")
-            ax2.set_xlabel("")
+            ax2.set_title("Top 5 Customers by Revenue", fontsize=14, pad=8)
+            ax2.set_ylabel("Revenue"); ax2.set_xlabel("")
+            ax2.grid(axis="y", alpha=0.2)
+        fig2.tight_layout()
         st.pyplot(fig2, clear_figure=True)
 
-    colC, _ = st.columns([2,1])
+    colC, colD = st.columns(2)
     with colC:
-        fig3, ax3 = plt.subplots()
+        fig3, ax3 = plt.subplots(figsize=(FIG_W, FIG_H))
         if "Category" in df2.columns:
             mix = df2.groupby("Category")["Revenue"].sum()
             if len(mix) > 0:
-                ax3.pie(mix.values, labels=mix.index, autopct="%1.0f%%")
-                ax3.set_title("Product Mix by Revenue")
+                ax3.pie(mix.values, labels=mix.index, autopct="%1.0f%%", pctdistance=0.8)
+                ax3.set_title("Product Mix by Revenue", fontsize=14, pad=8)
+        fig3.tight_layout()
         st.pyplot(fig3, clear_figure=True)
 
-    # Forecast preview if we have history
-    if len(mrev) >= 6:
-        st.markdown("### 🔮 Forecast Preview")
-        fig4, ax4 = plt.subplots()
-        label = quick_forecast_plot(mrev, ax4)
+    with colD:
+        fig4, ax4 = plt.subplots(figsize=(FIG_W, FIG_H))
+        if {"Region","OrderDate","Revenue"}.issubset(df2.columns):
+            heat = df2.copy()
+            heat["Month"] = pd.to_datetime(heat["OrderDate"]).dt.to_period("M").astype(str)
+            pv = heat.pivot_table(index="Region", columns="Month", values="Revenue", aggfunc="sum").fillna(0.0)
+            im = ax4.imshow(pv.values, aspect="auto")
+            ax4.set_yticks(range(len(pv.index))); ax4.set_yticklabels(pv.index)
+            ax4.set_xticks(range(len(pv.columns))); ax4.set_xticklabels(pv.columns, rotation=45, ha="right", fontsize=8)
+            ax4.set_title("Region × Month Heatmap (Revenue)", fontsize=14, pad=8)
+            fig4.colorbar(im, ax=ax4, shrink=0.85)
+        fig4.tight_layout()
         st.pyplot(fig4, clear_figure=True)
+
+    # Compact forecast preview with band (only if we have ≥ 12 months; seasonal if ≥ 24)
+    if len(mrev) >= 12:
+        st.markdown("### 🔮 Forecast Preview")
+        figF, axF = plt.subplots(figsize=(FIG_W*1.05, FIG_H))
+        fcast, label, resid_std = quick_forecast(mrev, horizon=6)
+        mrev["Revenue"].plot(ax=axF, label="History")
+        fcast.plot(ax=axF, style="--", label="Forecast")
+        # simple ~95% band
+        axF.fill_between(fcast.index, fcast - 1.96*resid_std, fcast + 1.96*resid_std, alpha=0.2)
+        axF.set_title("Revenue Forecast (next 6 months)", fontsize=14, pad=8)
+        axF.set_ylabel("Revenue"); axF.grid(alpha=0.2); axF.legend()
+        figF.tight_layout()
+        st.pyplot(figF, clear_figure=True)
         st.caption(f"*Model used: {label}*")
 
     st.markdown("---")
@@ -384,12 +437,12 @@ if df is not None:
     if run_now:
         st.session_state["last_prompt"] = user_prompt
         with st.spinner("Asking Gemini…"):
-            code = llm_generate_code(user_prompt, df2)
+            code = llm_generate_code(user_prompt, ensure_dates_and_revenue(df))
         st.subheader("Sanitized code (imports auto-removed)")
         st.code(sanitize_code(code) if code else "# empty", language="python")
         if code and not code.strip().startswith("# ERROR"):
             with st.spinner("Executing safely…"):
-                result_df, fig, logs = run_snippet(code, df2)
+                result_df, fig, logs = run_snippet(code, ensure_dates_and_revenue(df))
             st.markdown(f"**Logs:** {logs}")
             if isinstance(result_df, pd.DataFrame):
                 st.subheader("Result table"); st.dataframe(result_df, use_container_width=True)
