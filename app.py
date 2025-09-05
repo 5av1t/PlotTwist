@@ -27,6 +27,14 @@ if "GOOGLE_API_KEY" in st.secrets:
 if API_KEY:
     genai.configure(api_key=API_KEY)
 
+# ================== POWER MODE (safe-but-flexible) ==================
+# You can allow a whitelist of imports in "Pro mode".
+DEFAULT_ALLOWED_PREFIXES = [
+    "pandas", "numpy", "matplotlib", "sklearn.linear_model", "statsmodels.tsa.holtwinters", "scipy", "scipy.stats"
+]
+# Optional seaborn (only if installed); leave off by default
+SEABORN_PREFIX = "seaborn"
+
 # ---------- Format helpers ----------
 def fmt_currency(x):
     try: x = float(x)
@@ -69,27 +77,47 @@ def fill_between_datetime(ax, x_like, y1, y2, **kwargs):
     ax.xaxis_date()
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
 
-# ================== LLM PROMPT ==================
-SYSTEM_PREAMBLE = """
+# ================== LLM PROMPT (dynamic by mode) ==================
+BASE_PREAMBLE = """
 You are a Python data assistant. Output ONLY a Python code snippet (no backticks, no prose).
 
-Constraints:
-- DataFrame is preloaded as `df`.
-- Allowed: pandas as pd, numpy as np, matplotlib.pyplot as plt, matplotlib.dates as mdates.
-- Forbidden: imports, file I/O, network, os/sys/subprocess/pathlib/socket/pickle/tempfile, input(), exec/eval/compile, __import__.
-- For forecasting/analytics, you already have: ExponentialSmoothing, LinearRegression, datetime.
-- Do NOT import these, just use them directly.
-- If you produce a table, assign to `result_df`.
-- If you produce a chart, assign to `fig = plt.gcf()`.
+Data:
+- A pandas DataFrame is preloaded as `df`.
 
-Time-series plotting rules (MUST follow to avoid crashes):
-- Always use the provided helpers `plot_datetime(ax, x, y)` and `fill_between_datetime(ax, x, y1, y2)` for any date x-axis.
-- Do not pass string dates directly to matplotlib/pandas `.plot(...)`.
-- Prefer trend-only ExponentialSmoothing unless the dataset has ≥24 months for seasonality.
-- Keep code under 120 lines.
+Charting:
+- Use pandas/numpy/matplotlib.
+- For any date x-axis, ALWAYS use the helpers:
+  • plot_datetime(ax, x, y)
+  • fill_between_datetime(ax, x, y1, y2)
+- Assign tables to `result_df`, charts to `fig = plt.gcf()`.
+
+Forecasting:
+- You already have ExponentialSmoothing, LinearRegression, datetime.
+- Prefer trend-only ExponentialSmoothing unless dataset has ≥24 months for seasonality.
+
+Limits:
+- No network calls. Keep code under 120 lines.
 """
 
-def llm_generate_code(user_instruction, df):
+def build_preamble(pro_mode: bool, allow_seaborn: bool) -> str:
+    if pro_mode:
+        allowed = DEFAULT_ALLOWED_PREFIXES.copy()
+        if allow_seaborn:
+            allowed.append(SEABORN_PREFIX)
+        allowed_str = ", ".join(allowed)
+        return BASE_PREAMBLE + f"""
+
+Imports (Pro Mode):
+- You MAY import ONLY from these packages/prefixes: {allowed_str}.
+- Do NOT import anything else (no os/sys/subprocess/requests/pathlib/importlib/etc).
+"""
+    else:
+        return BASE_PREAMBLE + """
+Imports (Standard Mode):
+- Do NOT import anything; required libs are preloaded for you.
+"""
+
+def llm_generate_code(user_instruction, df, pro_mode: bool, allow_seaborn: bool):
     if not API_KEY:
         return "# ERROR: Missing GOOGLE_API_KEY.\nresult_df = df.head(5)"
     schema = {
@@ -97,7 +125,8 @@ def llm_generate_code(user_instruction, df):
         "dtypes": {c: str(df[c].dtype) for c in df.columns},
         "sample_rows": _sample_rows_json(df, 3),
     }
-    prompt = SYSTEM_PREAMBLE + "\nSchema:\n" + json.dumps(schema, indent=2) \
+    preamble = build_preamble(pro_mode, allow_seaborn)
+    prompt = preamble + "\nSchema:\n" + json.dumps(schema, indent=2) \
              + "\n\nUser request:\n" + (user_instruction or "") + "\n\n# Python code only:\n"
     try:
         model = genai.GenerativeModel(MODEL_NAME)
@@ -133,16 +162,25 @@ def read_any_table(uploaded):
         raise ValueError("This .xlsx isn’t a valid Excel file. Try CSV instead.")
     return try_csv(raw)
 
-# ================== SANDBOX ==================
-IMPORT_LINE_RE = re.compile(r'^\s*(?:from\s+\S+\s+import\s+.*|import\s+.+)$')
+# ================== SANDBOX (with optional whitelisted imports) ==================
+IMPORT_LINE_RE = re.compile(r'^\s*(?:from\s+([A-Za-z0-9_\.]+)\s+import\s+.*|import\s+([A-Za-z0-9_\. ,]+))\s*$')
 CONTINUATION_RE = re.compile(r'.*\\\s*$')
 
-def sanitize_code(snippet):
+FORBIDDEN_CALLS = {"open","exec","eval","compile","__import__","input","system"}
+FORBIDDEN_ATTR_ROOTS = {"os","sys","subprocess","pathlib","socket","requests","shutil","pickle","dill","tempfile","builtins","importlib"}
+FORBIDDEN_NODES_ALWAYS = ()  # we’ll decide import allowance dynamically
+DISALLOWED_ATTR_NAMES = {"__dict__","__class__","__mro__","__subclasses__","__globals__","__getattribute__","__getattr__"}
+
+def sanitize_code(snippet: str, pro_mode: bool) -> str:
     if not isinstance(snippet, str): return ""
     code = snippet.strip()
     if code.startswith("```"):
         code = "\n".join(ln for ln in code.splitlines() if not ln.strip().startswith("```") and not ln.strip().startswith("python"))
-    cleaned, skip = [], False
+    if pro_mode:
+        # Keep imports; we'll validate them
+        return code
+    # Standard: strip all imports
+    cleaned_lines, skip = [], False
     for ln in code.splitlines():
         if skip:
             if CONTINUATION_RE.match(ln): continue
@@ -150,51 +188,96 @@ def sanitize_code(snippet):
         if IMPORT_LINE_RE.match(ln):
             if CONTINUATION_RE.match(ln): skip = True
             continue
-        cleaned.append(ln)
-    return "\n".join(cleaned)
+        cleaned_lines.append(ln)
+    return "\n".join(cleaned_lines)
 
-FORBIDDEN_CALLS = {"open","exec","eval","compile","__import__","input","system"}
-FORBIDDEN_ATTR_ROOTS = {"os","sys","subprocess","pathlib","socket","requests","shutil","pickle","dill","tempfile","builtins","importlib"}
-FORBIDDEN_NODES = (ast.Import, ast.ImportFrom)
-DISALLOWED_ATTR_NAMES = {"__dict__","__class__","__mro__","__subclasses__","__globals__","__getattribute__","__getattr__"}
+def _module_prefix_allowed(mod: str, allowed_prefixes: list[str]) -> bool:
+    return any(mod == p or mod.startswith(p + ".") for p in allowed_prefixes)
 
-def validate_snippet(snippet):
-    try: tree = ast.parse(snippet)
-    except Exception as e: return False, f"Code not parsable: {e}"
+def validate_snippet(snippet: str, pro_mode: bool, allow_seaborn: bool):
+    try:
+        tree = ast.parse(snippet)
+    except Exception as e:
+        return False, f"Code not parsable: {e}"
+
+    allowed_prefixes = DEFAULT_ALLOWED_PREFIXES.copy()
+    if allow_seaborn:
+        allowed_prefixes.append(SEABORN_PREFIX)
+
     class Guard(ast.NodeVisitor):
         def visit(self, node):
-            if isinstance(node, FORBIDDEN_NODES): raise ValueError(f"Forbidden node: {type(node).__name__}")
+            # Allow import nodes in pro mode (but only whitelisted)
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                if not pro_mode:
+                    raise ValueError("Imports are not allowed in Standard Mode.")
+                # Validate module name
+                mod = None
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        mod = alias.name
+                        if not _module_prefix_allowed(mod, allowed_prefixes):
+                            raise ValueError(f"Disallowed import: {mod}")
+                else:  # ImportFrom
+                    mod = node.module or ""
+                    if not _module_prefix_allowed(mod, allowed_prefixes):
+                        raise ValueError(f"Disallowed import-from: {mod}")
+                return  # OK
             return super().visit(node)
-        def visit_Call(self, node):
+
+        def visit_Call(self, node: ast.Call):
             if isinstance(node.func, ast.Name) and node.func.id in FORBIDDEN_CALLS:
                 raise ValueError(f"Forbidden call: {node.func.id}()")
             self.generic_visit(node)
-        def visit_Attribute(self, node):
-            if node.attr in DISALLOWED_ATTR_NAMES: raise ValueError(f"Forbidden attribute: {node.attr}")
+
+        def visit_Attribute(self, node: ast.Attribute):
+            if node.attr in DISALLOWED_ATTR_NAMES:
+                raise ValueError(f"Forbidden attribute: {node.attr}")
             base = node
-            while isinstance(base, ast.Attribute): base = base.value
+            while isinstance(base, ast.Attribute):
+                base = base.value
             if isinstance(base, ast.Name) and base.id in FORBIDDEN_ATTR_ROOTS:
                 raise ValueError(f"Forbidden module usage: {base.id}.*")
             self.generic_visit(node)
-    try: Guard().visit(tree)
-    except ValueError as ve: return False, str(ve)
+
+    try:
+        Guard().visit(tree)
+    except ValueError as ve:
+        return False, str(ve)
     return True, None
 
-def run_snippet(snippet, df):
-    cleaned = sanitize_code(snippet)
-    ok, err = validate_snippet(cleaned)
-    if not ok: return None, None, f"Validation failed: {err}"
+# Custom import gate (used only in pro mode)
+def make_safe_import(allowed_prefixes: list[str]):
+    real_import = __import__
+    def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
+        if not _module_prefix_allowed(name, allowed_prefixes):
+            raise ImportError(f"Blocked import: {name}")
+        return real_import(name, globals, locals, fromlist, level)
+    return _safe_import
 
-    # Safe globals that LLM code can use
+def run_snippet(snippet: str, df: pd.DataFrame, pro_mode: bool, allow_seaborn: bool):
+    cleaned = sanitize_code(snippet, pro_mode)
+    ok, err = validate_snippet(cleaned, pro_mode, allow_seaborn)
+    if not ok:
+        return None, None, f"Validation failed: {err}"
+
+    allowed_prefixes = DEFAULT_ALLOWED_PREFIXES.copy()
+    if allow_seaborn:
+        allowed_prefixes.append(SEABORN_PREFIX)
+
+    # Safe globals exposed to LLM
     safe_globals = {
         "pd": pd, "np": np, "plt": plt, "mdates": mdates,
         "ExponentialSmoothing": ExponentialSmoothing,
         "LinearRegression": LinearRegression,
         "datetime": datetime,
-        # expose date-safe helpers to LLM
         "plot_datetime": plot_datetime,
         "fill_between_datetime": fill_between_datetime,
+        "__builtins__": __builtins__.__dict__.copy(),  # we’ll override __import__ if pro_mode
     }
+
+    if pro_mode:
+        safe_globals["__builtins__"]["__import__"] = make_safe_import(allowed_prefixes)
+
     safe_locals = {"df": df.copy()}
 
     try:
@@ -235,23 +318,25 @@ def monthly_revenue(df):
 
 # ================== SIDEBAR ==================
 with st.sidebar:
-    st.header("⬇️ Download Templates")
+    st.header("⚙️ Mode & Templates")
+    pro_mode = st.toggle("Pro mode: allow whitelisted imports", value=False, help="Lets Gemini import from safe packages (pandas, numpy, matplotlib, sklearn.linear_model, statsmodels.tsa.holtwinters, scipy.stats).")
+    allow_seaborn = st.toggle("Also allow seaborn (if installed)", value=False)
+    st.caption("Use RAW links for these files in your repo.")
     try:
         rx = requests.get(RAW_XLSX_URL, timeout=8); rx.raise_for_status()
-        st.download_button("Excel (.xlsx)", data=rx.content, file_name="sales_template.xlsx",
+        st.download_button("Excel (.xlsx) template", data=rx.content, file_name="sales_template.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     except Exception:
         st.warning("Excel template not available")
-
     try:
         rc = requests.get(RAW_CSV_URL, timeout=8); rc.raise_for_status()
-        st.download_button("CSV (.csv)", data=rc.content, file_name="sales_template.csv", mime="text/csv")
+        st.download_button("CSV (.csv) template", data=rc.content, file_name="sales_template.csv", mime="text/csv")
     except Exception:
         st.warning("CSV template not available")
 
 # ================== MAIN UI ==================
-st.title("📊 PlotTwist — Sales Analytics Copilot")
-st.caption("Upload Excel/CSV → Gemini generates insights → Compact KPIs + charts.")
+st.title("📊 PlotTwist — Sales Analytics Copilot (Super App)")
+st.caption("Upload Excel/CSV → Gemini generates insights → Compact KPIs + charts. Pro mode allows safe imports.")
 
 file = st.file_uploader("Upload sales file (.xlsx or .csv)", type=["xlsx","csv"])
 df2 = None
@@ -278,18 +363,18 @@ if df2 is not None:
     if run_now:
         st.session_state["last_prompt"] = user_prompt
         with st.spinner("Asking Gemini…"):
-            code = llm_generate_code(user_prompt, df2)
-        st.subheader("Sanitized code (imports removed)")
-        st.code(sanitize_code(code) if code else "# empty", language="python")
+            code = llm_generate_code(user_prompt, df2, pro_mode, allow_seaborn)
+        st.subheader("Sanitized/validated code")
+        st.code(code if code else "# empty", language="python")
         if code and not code.strip().startswith("# ERROR"):
             with st.spinner("Executing safely…"):
-                result_df, fig, logs = run_snippet(code, df2)
+                result_df, fig, logs = run_snippet(code, df2, pro_mode, allow_seaborn)
             st.markdown(f"**Logs:** {logs}")
             if isinstance(result_df, pd.DataFrame): st.dataframe(result_df, use_container_width=True)
             if fig is not None: st.pyplot(fig, use_container_width=False, clear_figure=True)
         st.session_state["ran_auto"] = True
 
-    # ===== Forecast Preview (date-safe) =====
+    # ===== Optional compact forecast preview (date-safe) =====
     mrev = monthly_revenue(df2)
     if len(mrev) >= 12:
         st.markdown("### 🔮 Forecast Preview")
@@ -304,7 +389,6 @@ if df2 is not None:
         else:
             model = ExponentialSmoothing(y, trend="add").fit()
             label = "ETS Additive (trend-only)"
-
         fcast = model.forecast(6)
         resid = y - model.fittedvalues.reindex(y.index).bfill()
         resid_std = float(np.nanstd(resid))
