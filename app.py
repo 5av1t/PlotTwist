@@ -297,7 +297,7 @@ def monthly_revenue(df):
 # ================== SIDEBAR ==================
 with st.sidebar:
     st.header("Templates")
-    st.caption("Use RAW links from your repo for clean downloads.")
+    st.caption("Click one of the links below to start download.")
     try:
         rx = requests.get(RAW_XLSX_URL, timeout=8); rx.raise_for_status()
         st.download_button("Excel template", data=rx.content, file_name="sales_template.xlsx",
