@@ -1,10 +1,11 @@
-import os, io, json, ast, traceback, re, zipfile
+import os, io, json, ast, traceback, re
 import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import google.generativeai as genai
 import requests
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
@@ -16,7 +17,6 @@ st.set_page_config(page_title="PlotTwist — Sales Analytics Copilot", page_icon
 MODEL_NAME = "gemini-1.5-flash"
 FIG_W, FIG_H = 3.5, 2.4
 
-# Template file URLs (replace with your GitHub RAW URLs after upload)
 RAW_XLSX_URL = "https://raw.githubusercontent.com/5av1t/plottwist/main/sales_template.xlsx"
 RAW_CSV_URL = "https://raw.githubusercontent.com/5av1t/plottwist/main/sales_template.csv"
 
@@ -87,7 +87,7 @@ def llm_generate_code(user_instruction, df):
     except Exception as e:
         return f"# ERROR calling Google AI: {e}\nresult_df = df.head(5)"
 
-# ================== UPLOAD READER (robust for mobile) ==================
+# ================== UPLOAD READER ==================
 def read_any_table(uploaded):
     if uploaded is None:
         raise ValueError("No file provided")
@@ -189,21 +189,25 @@ def ensure_dates_and_revenue(df):
         else: out["Revenue"] = np.nan
     return out
 
-def monthly_revenue(df): return df.dropna(subset=["OrderDate"]).set_index("OrderDate")["Revenue"].resample("MS").sum().to_frame()
+def monthly_revenue(df):
+    s = pd.to_datetime(df["OrderDate"], errors="coerce")
+    m = pd.Series(pd.to_numeric(df["Revenue"], errors="coerce"), index=s)
+    out = m.dropna().resample("MS").sum().to_frame(name="Revenue")
+    out.index = pd.DatetimeIndex(out.index)
+    return out
 
 # ================== SIDEBAR ==================
 with st.sidebar:
-    st.header("⬇️ Download Sales Templates")
-    st.caption("Use these clean templates (5 years of data).")
+    st.header("⬇️ Download Templates")
     try:
         rx = requests.get(RAW_XLSX_URL, timeout=8); rx.raise_for_status()
-        st.download_button("Download Excel (.xlsx)", data=rx.content, file_name="sales_template.xlsx",
+        st.download_button("Excel (.xlsx)", data=rx.content, file_name="sales_template.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     except Exception: st.warning("Excel template not available")
 
     try:
         rc = requests.get(RAW_CSV_URL, timeout=8); rc.raise_for_status()
-        st.download_button("Download CSV (.csv)", data=rc.content, file_name="sales_template.csv", mime="text/csv")
+        st.download_button("CSV (.csv)", data=rc.content, file_name="sales_template.csv", mime="text/csv")
     except Exception: st.warning("CSV template not available")
 
 # ================== MAIN UI ==================
@@ -244,5 +248,40 @@ if df2 is not None:
             if isinstance(result_df, pd.DataFrame): st.dataframe(result_df, use_container_width=True)
             if fig is not None: st.pyplot(fig, use_container_width=False, clear_figure=True)
         st.session_state["ran_auto"] = True
+
+    # ===== Forecast Preview (safe for mobile) =====
+    mrev = monthly_revenue(df2)
+    if len(mrev) >= 12:
+        st.markdown("### 🔮 Forecast Preview")
+        y = mrev["Revenue"].astype(float)
+        if len(mrev) >= 24:
+            try:
+                model = ExponentialSmoothing(y, trend="add", seasonal="add", seasonal_periods=12).fit()
+                label = "ETS Additive (trend+seasonal)"
+            except Exception:
+                model = ExponentialSmoothing(y, trend="add").fit()
+                label = "ETS Additive (trend-only fallback)"
+        else:
+            model = ExponentialSmoothing(y, trend="add").fit()
+            label = "ETS Additive (trend-only)"
+        fcast = model.forecast(6)
+        resid = y - model.fittedvalues.reindex(y.index).bfill()
+        resid_std = float(np.nanstd(resid))
+        fcast.index = pd.date_range(start=mrev.index[-1] + pd.offsets.MonthBegin(1), periods=6, freq="MS")
+
+        figF, axF = plt.subplots(figsize=(FIG_W+0.7, FIG_H))
+        hist_x = mdates.date2num(mrev.index.to_pydatetime())
+        fcast_x = mdates.date2num(fcast.index.to_pydatetime())
+        axF.plot(hist_x, y.values, label="History")
+        axF.plot(fcast_x, fcast.values, linestyle="--", label="Forecast")
+        axF.fill_between(fcast_x, (fcast - 1.96*resid_std).values, (fcast + 1.96*resid_std).values, alpha=0.2)
+        axF.xaxis_date(); axF.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+        figF.autofmt_xdate()
+        axF.set_title("Revenue Forecast (6 mo)", fontsize=10, pad=6)
+        axF.set_ylabel("Revenue"); axF.grid(alpha=0.2); axF.legend(fontsize=8)
+        figF.tight_layout()
+        st.pyplot(figF, use_container_width=False, clear_figure=True)
+        st.caption(f"*Model used: {label}*")
+
 else:
     st.info("💡 Tip: Download a template from the sidebar and try again.")
