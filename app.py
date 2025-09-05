@@ -11,7 +11,7 @@ import requests
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from sklearn.linear_model import LinearRegression
 import datetime
-from datetime import timedelta
+from datetime import timedelta  # ensure timedelta available to LLM code
 
 # ================== CONFIG ==================
 st.set_page_config(page_title="PlotTwist — Sales Analytics Copilot", page_icon="📊", layout="wide")
@@ -30,7 +30,8 @@ if API_KEY:
 
 # ================== POWER MODE (safe-but-flexible) ==================
 DEFAULT_ALLOWED_PREFIXES = [
-    "pandas", "numpy", "matplotlib", "sklearn.linear_model", "statsmodels.tsa.holtwinters", "scipy", "scipy.stats"
+    "pandas", "numpy", "matplotlib", "sklearn.linear_model",
+    "statsmodels.tsa.holtwinters", "scipy", "scipy.stats"
 ]
 SEABORN_PREFIX = "seaborn"  # optional
 
@@ -46,7 +47,6 @@ def fmt_percent(x):
     try: return f"{float(x):.1f}%"
     except Exception: return "—"
 
-# ---------- JSON-safe serializer ----------
 def _to_jsonable(x):
     if isinstance(x, (pd.Timestamp, datetime.datetime, datetime.date)):
         return x.isoformat()
@@ -59,7 +59,7 @@ def _sample_rows_json(df, n=3):
     if df.empty: return []
     return df.head(n).applymap(_to_jsonable).to_dict(orient="records")
 
-# ================== DATE-SAFE PLOTTING HELPERS ==================
+# ================== DATE-SAFE PLOTTING + TICK HELPERS ==================
 def plot_datetime(ax, x_like, y_vals, **kwargs):
     """Plot with a guaranteed date x-axis to avoid categorical UnitData issues."""
     xd = pd.to_datetime(x_like, errors="coerce")
@@ -76,6 +76,17 @@ def fill_between_datetime(ax, x_like, y1, y2, **kwargs):
     ax.xaxis_date()
     ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
 
+def set_tick_label_alignment(ax, axis="x", rotation=0, ha="center"):
+    """Safely set rotation + horizontal alignment on tick labels (avoid ha inside tick_params)."""
+    if axis in ("x", "both"):
+        for lbl in ax.get_xticklabels():
+            lbl.set_rotation(rotation)
+            lbl.set_horizontalalignment(ha)
+    if axis in ("y", "both"):
+        for lbl in ax.get_yticklabels():
+            lbl.set_rotation(rotation)
+            lbl.set_horizontalalignment(ha)
+
 # ================== LLM PROMPT (dynamic by mode) ==================
 BASE_PREAMBLE = """
 You are a Python data assistant. Output ONLY a Python code snippet (no backticks, no prose).
@@ -85,13 +96,17 @@ Data:
 
 Charting:
 - Use pandas/numpy/matplotlib.
-- For any date x-axis, ALWAYS use the helpers:
+- For any date x-axis, ALWAYS use:
   • plot_datetime(ax, x, y)
   • fill_between_datetime(ax, x, y1, y2)
+- To rotate/align tick labels, use set_tick_label_alignment(ax, axis="x", rotation=45, ha="right").
+  Do NOT pass 'ha' to tick_params.
+
+Results:
 - Assign tables to `result_df`, charts to `fig = plt.gcf()`.
 
 Forecasting:
-- You already have ExponentialSmoothing, LinearRegression, datetime.
+- You already have ExponentialSmoothing, LinearRegression, datetime, timedelta.
 - Prefer trend-only ExponentialSmoothing unless dataset has ≥24 months for seasonality.
 
 Limits:
@@ -161,35 +176,40 @@ def read_any_table(uploaded):
         raise ValueError("This .xlsx isn’t a valid Excel file. Try CSV instead.")
     return try_csv(raw)
 
-# ================== SANDBOX (with optional whitelisted imports) ==================
+# ================== SANITIZER / SANDBOX ==================
 IMPORT_LINE_RE = re.compile(r'^\s*(?:from\s+([A-Za-z0-9_\.]+)\s+import\s+.*|import\s+([A-Za-z0-9_\. ,]+))\s*$')
 CONTINUATION_RE = re.compile(r'.*\\\s*$')
+
+def _module_prefix_allowed(mod: str, allowed_prefixes: list[str]) -> bool:
+    return any(mod == p or mod.startswith(p + ".") for p in allowed_prefixes)
 
 FORBIDDEN_CALLS = {"open","exec","eval","compile","__import__","input","system"}
 FORBIDDEN_ATTR_ROOTS = {"os","sys","subprocess","pathlib","socket","requests","shutil","pickle","dill","tempfile","builtins","importlib"}
 DISALLOWED_ATTR_NAMES = {"__dict__","__class__","__mro__","__subclasses__","__globals__","__getattribute__","__getattr__"}
 
 def sanitize_code(snippet: str, pro_mode: bool) -> str:
+    """Strip disallowed imports in Standard Mode and remove bad tick_params kwargs like ha=."""
     if not isinstance(snippet, str): return ""
     code = snippet.strip()
     if code.startswith("```"):
-        code = "\n".join(ln for ln in code.splitlines() if not ln.strip().startswith("```") and not ln.strip().startswith("python"))
-    if pro_mode:
-        return code  # keep imports; validate later
-    # Standard: strip all imports entirely
-    cleaned_lines, skip = [], False
-    for ln in code.splitlines():
-        if skip:
-            if CONTINUATION_RE.match(ln): continue
-            else: skip = False; continue
-        if IMPORT_LINE_RE.match(ln):
-            if CONTINUATION_RE.match(ln): skip = True
-            continue
-        cleaned_lines.append(ln)
-    return "\n".join(cleaned_lines)
-
-def _module_prefix_allowed(mod: str, allowed_prefixes: list[str]) -> bool:
-    return any(mod == p or mod.startswith(p + ".") for p in allowed_prefixes)
+        code = "\n".join(ln for ln in code.splitlines()
+                         if not ln.strip().startswith("```") and not ln.strip().startswith("python"))
+    lines = code.splitlines()
+    cleaned, skip = [], False
+    for ln in lines:
+        # Remove bad 'ha=' if used inside tick_params(...)
+        if "tick_params(" in ln and "ha=" in ln:
+            # drop ha=... safely
+            ln = re.sub(r"\s*ha\s*=\s*['\"][^'\"]+['\"]\s*,?", "", ln)
+        if not pro_mode:
+            if skip:
+                if CONTINUATION_RE.match(ln): continue
+                else: skip = False; continue
+            if IMPORT_LINE_RE.match(ln):
+                if CONTINUATION_RE.match(ln): skip = True
+                continue
+        cleaned.append(ln)
+    return "\n".join(cleaned)
 
 def validate_snippet(snippet: str, pro_mode: bool, allow_seaborn: bool):
     try:
@@ -203,20 +223,13 @@ def validate_snippet(snippet: str, pro_mode: bool, allow_seaborn: bool):
 
     class Guard(ast.NodeVisitor):
         def visit(self, node):
-            # allow/validate imports in pro mode only
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 if not pro_mode:
                     raise ValueError("Imports are not allowed in Standard Mode.")
-                mod = None
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        mod = alias.name
-                        if not _module_prefix_allowed(mod, allowed_prefixes):
-                            raise ValueError(f"Disallowed import: {mod}")
-                else:
-                    mod = node.module or ""
-                    if not _module_prefix_allowed(mod, allowed_prefixes):
-                        raise ValueError(f"Disallowed import-from: {mod}")
+                mod = node.module if isinstance(node, ast.ImportFrom) else (
+                    node.names[0].name if node.names else "")
+                if mod and not _module_prefix_allowed(mod, allowed_prefixes):
+                    raise ValueError(f"Disallowed import: {mod}")
                 return
             return super().visit(node)
 
@@ -259,21 +272,20 @@ def run_snippet(snippet: str, df: pd.DataFrame, pro_mode: bool, allow_seaborn: b
     if allow_seaborn:
         allowed_prefixes.append(SEABORN_PREFIX)
 
-    # Build safe __builtins__ consistently across runtimes (module vs dict)
     builtins_obj = __builtins__
     builtins_dict = builtins_obj if isinstance(builtins_obj, dict) else builtins_obj.__dict__
     safe_builtins = builtins_dict.copy()
     if pro_mode:
         safe_builtins["__import__"] = make_safe_import(allowed_prefixes)
 
-    # Safe globals exposed to LLM code
     safe_globals = {
         "pd": pd, "np": np, "plt": plt, "mdates": mdates,
         "ExponentialSmoothing": ExponentialSmoothing,
         "LinearRegression": LinearRegression,
-        "datetime": datetime,
+        "datetime": datetime, "timedelta": timedelta,
         "plot_datetime": plot_datetime,
         "fill_between_datetime": fill_between_datetime,
+        "set_tick_label_alignment": set_tick_label_alignment,
         "__builtins__": safe_builtins,
     }
     safe_locals = {"df": df.copy()}
@@ -318,17 +330,15 @@ def monthly_revenue(df):
 with st.sidebar:
     st.header("⚙️ Mode & Templates")
     pro_mode = st.toggle("Pro mode: allow whitelisted imports", value=False,
-                         help="Allows imports from pandas, numpy, matplotlib, sklearn.linear_model, statsmodels.tsa.holtwinters, scipy.stats (and optionally seaborn).")
+                         help="Allows imports from pandas/numpy/matplotlib/sklearn.linear_model/statsmodels.tsa.holtwinters/scipy.stats (and optionally seaborn).")
     allow_seaborn = st.toggle("Also allow seaborn (if installed)", value=False)
-
-    st.caption("Use RAW links for these files in your repo.")
+    st.caption("Use RAW links from your repo for these downloads.")
     try:
         rx = requests.get(RAW_XLSX_URL, timeout=8); rx.raise_for_status()
         st.download_button("Excel (.xlsx) template", data=rx.content, file_name="sales_template.xlsx",
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     except Exception:
         st.warning("Excel template not available")
-
     try:
         rc = requests.get(RAW_CSV_URL, timeout=8); rc.raise_for_status()
         st.download_button("CSV (.csv) template", data=rc.content, file_name="sales_template.csv", mime="text/csv")
@@ -356,7 +366,7 @@ if df2 is not None:
         "Summarize the dataset with 1) monthly revenue trend (compact line), "
         "2) top 5 customers (bar), 3) total revenue + avg order value table, "
         "and if >=24 months, forecast next 6 months with ExponentialSmoothing. "
-        "For any date x-axis, use plot_datetime(ax, x, y) and fill_between_datetime(ax, x, y1, y2)."
+        "For dates use plot_datetime/fill_between_datetime; for tick text use set_tick_label_alignment."
     )
     if "ran_auto" not in st.session_state: st.session_state["ran_auto"] = False
     user_prompt = st.text_area("Your prompt", value=st.session_state.get("last_prompt", default_prompt), height=90)
@@ -371,11 +381,13 @@ if df2 is not None:
             with st.spinner("Executing safely…"):
                 result_df, fig, logs = run_snippet(code, df2, pro_mode, allow_seaborn)
             st.markdown(f"**Logs:** {logs}")
-            if isinstance(result_df, pd.DataFrame): st.dataframe(result_df, use_container_width=True)
-            if fig is not None: st.pyplot(fig, use_container_width=False, clear_figure=True)
+            if isinstance(result_df, pd.DataFrame):
+                st.dataframe(result_df, use_container_width=True)
+            if fig is not None:
+                st.pyplot(fig, use_container_width=False, clear_figure=True)
         st.session_state["ran_auto"] = True
 
-    # ===== Optional compact forecast preview (date-safe) =====
+    # ===== Compact forecast preview (date-safe) =====
     mrev = monthly_revenue(df2)
     if len(mrev) >= 12:
         st.markdown("### 🔮 Forecast Preview")
@@ -399,6 +411,7 @@ if df2 is not None:
         plot_datetime(axF, mrev.index, y.values, label="History")
         plot_datetime(axF, fcast.index, fcast.values, linestyle="--", label="Forecast")
         fill_between_datetime(axF, fcast.index, (fcast - 1.96*resid_std).values, (fcast + 1.96*resid_std).values, alpha=0.2)
+        set_tick_label_alignment(axF, axis="x", rotation=45, ha="right")
         axF.set_title("Revenue Forecast (6 mo)", fontsize=10, pad=6)
         axF.set_ylabel("Revenue"); axF.grid(alpha=0.2); axF.legend(fontsize=8)
         figF.tight_layout()
