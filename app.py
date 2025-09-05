@@ -28,12 +28,10 @@ if API_KEY:
     genai.configure(api_key=API_KEY)
 
 # ================== POWER MODE (safe-but-flexible) ==================
-# You can allow a whitelist of imports in "Pro mode".
 DEFAULT_ALLOWED_PREFIXES = [
     "pandas", "numpy", "matplotlib", "sklearn.linear_model", "statsmodels.tsa.holtwinters", "scipy", "scipy.stats"
 ]
-# Optional seaborn (only if installed); leave off by default
-SEABORN_PREFIX = "seaborn"
+SEABORN_PREFIX = "seaborn"  # optional
 
 # ---------- Format helpers ----------
 def fmt_currency(x):
@@ -168,7 +166,6 @@ CONTINUATION_RE = re.compile(r'.*\\\s*$')
 
 FORBIDDEN_CALLS = {"open","exec","eval","compile","__import__","input","system"}
 FORBIDDEN_ATTR_ROOTS = {"os","sys","subprocess","pathlib","socket","requests","shutil","pickle","dill","tempfile","builtins","importlib"}
-FORBIDDEN_NODES_ALWAYS = ()  # we’ll decide import allowance dynamically
 DISALLOWED_ATTR_NAMES = {"__dict__","__class__","__mro__","__subclasses__","__globals__","__getattribute__","__getattr__"}
 
 def sanitize_code(snippet: str, pro_mode: bool) -> str:
@@ -177,9 +174,8 @@ def sanitize_code(snippet: str, pro_mode: bool) -> str:
     if code.startswith("```"):
         code = "\n".join(ln for ln in code.splitlines() if not ln.strip().startswith("```") and not ln.strip().startswith("python"))
     if pro_mode:
-        # Keep imports; we'll validate them
-        return code
-    # Standard: strip all imports
+        return code  # keep imports; validate later
+    # Standard: strip all imports entirely
     cleaned_lines, skip = [], False
     for ln in code.splitlines():
         if skip:
@@ -206,22 +202,21 @@ def validate_snippet(snippet: str, pro_mode: bool, allow_seaborn: bool):
 
     class Guard(ast.NodeVisitor):
         def visit(self, node):
-            # Allow import nodes in pro mode (but only whitelisted)
+            # allow/validate imports in pro mode only
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 if not pro_mode:
                     raise ValueError("Imports are not allowed in Standard Mode.")
-                # Validate module name
                 mod = None
                 if isinstance(node, ast.Import):
                     for alias in node.names:
                         mod = alias.name
                         if not _module_prefix_allowed(mod, allowed_prefixes):
                             raise ValueError(f"Disallowed import: {mod}")
-                else:  # ImportFrom
+                else:
                     mod = node.module or ""
                     if not _module_prefix_allowed(mod, allowed_prefixes):
                         raise ValueError(f"Disallowed import-from: {mod}")
-                return  # OK
+                return
             return super().visit(node)
 
         def visit_Call(self, node: ast.Call):
@@ -245,7 +240,6 @@ def validate_snippet(snippet: str, pro_mode: bool, allow_seaborn: bool):
         return False, str(ve)
     return True, None
 
-# Custom import gate (used only in pro mode)
 def make_safe_import(allowed_prefixes: list[str]):
     real_import = __import__
     def _safe_import(name, globals=None, locals=None, fromlist=(), level=0):
@@ -264,7 +258,14 @@ def run_snippet(snippet: str, df: pd.DataFrame, pro_mode: bool, allow_seaborn: b
     if allow_seaborn:
         allowed_prefixes.append(SEABORN_PREFIX)
 
-    # Safe globals exposed to LLM
+    # Build safe __builtins__ consistently across runtimes (module vs dict)
+    builtins_obj = __builtins__
+    builtins_dict = builtins_obj if isinstance(builtins_obj, dict) else builtins_obj.__dict__
+    safe_builtins = builtins_dict.copy()
+    if pro_mode:
+        safe_builtins["__import__"] = make_safe_import(allowed_prefixes)
+
+    # Safe globals exposed to LLM code
     safe_globals = {
         "pd": pd, "np": np, "plt": plt, "mdates": mdates,
         "ExponentialSmoothing": ExponentialSmoothing,
@@ -272,12 +273,8 @@ def run_snippet(snippet: str, df: pd.DataFrame, pro_mode: bool, allow_seaborn: b
         "datetime": datetime,
         "plot_datetime": plot_datetime,
         "fill_between_datetime": fill_between_datetime,
-        "__builtins__": __builtins__.__dict__.copy(),  # we’ll override __import__ if pro_mode
+        "__builtins__": safe_builtins,
     }
-
-    if pro_mode:
-        safe_globals["__builtins__"]["__import__"] = make_safe_import(allowed_prefixes)
-
     safe_locals = {"df": df.copy()}
 
     try:
@@ -319,8 +316,10 @@ def monthly_revenue(df):
 # ================== SIDEBAR ==================
 with st.sidebar:
     st.header("⚙️ Mode & Templates")
-    pro_mode = st.toggle("Pro mode: allow whitelisted imports", value=False, help="Lets Gemini import from safe packages (pandas, numpy, matplotlib, sklearn.linear_model, statsmodels.tsa.holtwinters, scipy.stats).")
+    pro_mode = st.toggle("Pro mode: allow whitelisted imports", value=False,
+                         help="Allows imports from pandas, numpy, matplotlib, sklearn.linear_model, statsmodels.tsa.holtwinters, scipy.stats (and optionally seaborn).")
     allow_seaborn = st.toggle("Also allow seaborn (if installed)", value=False)
+
     st.caption("Use RAW links for these files in your repo.")
     try:
         rx = requests.get(RAW_XLSX_URL, timeout=8); rx.raise_for_status()
@@ -328,6 +327,7 @@ with st.sidebar:
                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     except Exception:
         st.warning("Excel template not available")
+
     try:
         rc = requests.get(RAW_CSV_URL, timeout=8); rc.raise_for_status()
         st.download_button("CSV (.csv) template", data=rc.content, file_name="sales_template.csv", mime="text/csv")
