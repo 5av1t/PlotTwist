@@ -14,7 +14,7 @@ import datetime
 from datetime import timedelta  # exposed for LLM code
 
 # ================== CONFIG ==================
-st.set_page_config(page_title="PlotTwist — Sales Analytics Copilot", page_icon="📊", layout="wide")
+st.set_page_config(page_title="PlotTwist — Sales Analytics Copilot (Data-Aware)", page_icon="📊", layout="wide")
 MODEL_NAME = "gemini-1.5-flash"
 FIG_W, FIG_H = 3.5, 2.4
 
@@ -28,7 +28,7 @@ if API_KEY:
 
 # ================== SHIMS / HELPERS ==================
 def register_matplotlib_converters():
-    """No-op shim for legacy code snippets."""
+    """No-op shim for legacy code snippets that call this."""
     return None
 
 def fmt_currency(x):
@@ -82,12 +82,69 @@ def set_tick_label_alignment(ax, axis="x", rotation=0, ha="center"):
             lbl.set_rotation(rotation)
             lbl.set_horizontalalignment(ha)
 
-# ================== LLM PROMPTS ==================
+# ================== DATA SNAPSHOT (what Gemini sees) ==================
+def build_data_snapshot(df: pd.DataFrame, *, head_rows: int = 20, max_chars: int = 50000) -> dict:
+    """Create a compact but rich summary of the actual file so Gemini can code with awareness."""
+    snap = {}
+    # Schema + nulls
+    nulls = df.isna().sum().to_dict()
+    dtypes = {c: str(df[c].dtype) for c in df.columns}
+    rows, cols = df.shape
+    snap["shape"] = {"rows": int(rows), "cols": int(cols)}
+    snap["columns"] = list(df.columns)
+    snap["dtypes"] = dtypes
+    snap["null_counts"] = {k: int(v) for k, v in nulls.items()}
+
+    # Date range if a date-like column exists
+    date_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c]) or "date" in c.lower()]
+    date_info = {}
+    for c in date_cols[:3]:
+        try:
+            s = pd.to_datetime(df[c], errors="coerce")
+            if s.notna().any():
+                date_info[c] = {"min": s.min().isoformat() if pd.notna(s.min()) else None,
+                                "max": s.max().isoformat() if pd.notna(s.max()) else None}
+        except Exception:
+            pass
+    if date_info: snap["date_ranges"] = date_info
+
+    # Numeric describe (rounded)
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if num_cols:
+        desc = df[num_cols].describe().round(3).to_dict()
+        # Convert numpy types to python
+        snap["numeric_describe"] = {k: {kk: _to_jsonable(vv) for kk, vv in v.items()} for k, v in desc.items()}
+
+    # Categorical top values (up to 6 cols)
+    cat_cols = [c for c in df.columns if df[c].dtype == "object" or pd.api.types.is_categorical_dtype(df[c])]
+    cat_counts = {}
+    for c in cat_cols[:6]:
+        try:
+            vc = df[c].astype(str).value_counts().head(8)
+            cat_counts[c] = {str(k): int(v) for k, v in vc.items()}
+        except Exception:
+            continue
+    if cat_counts: snap["top_values"] = cat_counts
+
+    # CSV head (limit by rows and char budget)
+    try:
+        head_csv = df.head(head_rows).to_csv(index=False)
+        if len(head_csv) > max_chars:
+            head_csv = head_csv[:max_chars]
+        snap["csv_head"] = head_csv
+    except Exception:
+        snap["csv_head"] = ""
+
+    return snap
+
+# ================== LLM PROMPTS (data-aware) ==================
 BASE_RULES = """
 You are a Python data assistant. Output ONLY a Python code snippet (no backticks, no prose).
 
 Data:
 - A pandas DataFrame is preloaded as `df`.
+- You are also given a DATA SNAPSHOT extracted from the real file: schema, dtypes, nulls, value counts, numeric stats, and the CSV head.
+- Your code MUST be consistent with the snapshot (column names, types, shapes).
 
 Charting:
 - Use pandas/numpy/matplotlib.
@@ -117,7 +174,7 @@ def _remove_md_fences(text: str) -> str:
         return "\n".join(lines).strip()
     return text.strip()
 
-def llm_generate_code(user_instruction, df):
+def llm_generate_code(user_instruction, df, snapshot: dict):
     if not API_KEY:
         return "# ERROR: Missing GOOGLE_API_KEY.\nresult_df = df.head(5)"
     schema = {
@@ -125,14 +182,19 @@ def llm_generate_code(user_instruction, df):
         "dtypes": {c: str(df[c].dtype) for c in df.columns},
         "sample_rows": _sample_rows_json(df, 3),
     }
-    prompt = BASE_RULES + "\nSchema:\n" + json.dumps(schema, indent=2) \
-             + "\n\nUser request:\n" + (user_instruction or "") + "\n\n# Python code only:\n"
+    prompt = (
+        BASE_RULES
+        + "\n\n# DATA SNAPSHOT (JSON)\n" + json.dumps(snapshot, ensure_ascii=False)[:90000]
+        + "\n\n# LIGHT SCHEMA\n" + json.dumps(schema, ensure_ascii=False)
+        + "\n\n# USER REQUEST\n" + (user_instruction or "")
+        + "\n\n# PYTHON CODE ONLY BELOW\n"
+    )
     model = genai.GenerativeModel(MODEL_NAME)
     resp = model.generate_content(prompt)
     return _remove_md_fences(getattr(resp, "text", "") or "")
 
-def llm_repair_code(prev_code: str, error_text: str, df: pd.DataFrame):
-    """Ask Gemini to repair the previous code using the error and rules."""
+def llm_repair_code(prev_code: str, error_text: str, df: pd.DataFrame, snapshot: dict):
+    """Ask Gemini to repair the previous code using the error + snapshot."""
     if not API_KEY:
         return None
     schema = {
@@ -142,12 +204,13 @@ def llm_repair_code(prev_code: str, error_text: str, df: pd.DataFrame):
     }
     repair_prompt = (
         BASE_RULES
-        + "\nYou previously produced code that errored. Repair it.\n"
-        + "Return only corrected Python code (no backticks, no prose).\n\n"
-        + "### Previous code:\n" + prev_code + "\n\n"
-        + "### Error (verbatim):\n" + error_text + "\n\n"
-        + "### DataFrame schema (JSON):\n" + json.dumps(schema, indent=2)
-        + "\n\n# Corrected Python code only below:\n"
+        + "\nYou previously produced code that errored. Repair it using the DATA SNAPSHOT."
+        + "\nReturn only corrected Python code (no backticks, no prose)."
+        + "\n\n# PREVIOUS CODE\n" + prev_code
+        + "\n\n# ERROR\n" + error_text
+        + "\n\n# DATA SNAPSHOT (JSON)\n" + json.dumps(snapshot, ensure_ascii=False)[:90000]
+        + "\n\n# LIGHT SCHEMA\n" + json.dumps(schema, ensure_ascii=False)
+        + "\n\n# CORRECTED PYTHON CODE ONLY BELOW\n"
     )
     model = genai.GenerativeModel(MODEL_NAME)
     resp = model.generate_content(repair_prompt)
@@ -181,9 +244,11 @@ def run_snippet(snippet: str, df: pd.DataFrame):
     # Hard cleanup for a few common issues
     if "tick_params(" in snippet and "ha=" in snippet:
         snippet = re.sub(r"(tick_params\([^)]*)ha\s*=\s*['\"][^'\"]+['\"]\s*,?\s*", r"\1", snippet)
+
     builtins_obj = __builtins__
     builtins_dict = builtins_obj if isinstance(builtins_obj, dict) else builtins_obj.__dict__
     safe_builtins = builtins_dict.copy()
+
     safe_globals = {
         "pd": pd, "np": np, "plt": plt, "mdates": mdates,
         "ExponentialSmoothing": ExponentialSmoothing,
@@ -203,7 +268,6 @@ def run_snippet(snippet: str, df: pd.DataFrame):
         if fig and not fig.axes: fig = None
         return result_df, fig, "Executed OK"
     except Exception as e:
-        # Return full, readable error message
         return None, None, "Execution error:\n" + "".join(traceback.format_exception_only(type(e), e))
 
 # ================== AUTO-INSIGHTS HELPERS ==================
@@ -246,9 +310,16 @@ with st.sidebar:
     except Exception:
         st.warning("CSV template not available")
 
+    st.divider()
+    st.header("🔎 Gemini Data Access")
+    share_snapshot = st.checkbox("Share a snapshot of the uploaded file with Gemini", value=True,
+                                 help="Includes schema, stats, top values, and CSV head in the LLM prompt.")
+    head_rows = st.number_input("Rows to include in CSV head", 5, 200, 30, step=5)
+    max_chars = st.slider("Max characters for snapshot", 5_000, 120_000, 40_000, step=5_000)
+
 # ================== MAIN UI ==================
-st.title("📊 PlotTwist — Sales Analytics Copilot (Self-Healing)")
-st.caption("Upload Excel/CSV → Gemini generates insights → If code errors, Gemini auto-repairs it.")
+st.title("📊 PlotTwist — Sales Analytics Copilot (Data-Aware & Self-Healing)")
+st.caption("Upload Excel/CSV → Gemini sees a snapshot of your file → Generates code → Auto-repairs on error.")
 
 file = st.file_uploader("Upload sales file (.xlsx or .csv)", type=["xlsx","csv"])
 df2 = None
@@ -263,17 +334,24 @@ if file:
 if df2 is not None:
     st.markdown("### 🤖 Ask Gemini")
     default_prompt = (
-        "Summarize the dataset with 1) monthly revenue trend (small line), "
-        "2) top 5 customers (bar), 3) total revenue + average order value table, "
-        "and if ≥24 months, forecast next 6 months (single chart)."
+        "Create a concise, executive-ready analysis: "
+        "1) monthly revenue line (small), "
+        "2) top 5 customers bar, "
+        "3) total revenue & average order value table, "
+        "and if ≥24 months, 4) forecast next 6 months in the same chart."
     )
-    user_prompt = st.text_area("Your prompt", value=default_prompt, height=90)
+    user_prompt = st.text_area("Your prompt", value=default_prompt, height=100)
     auto_repair = st.checkbox("Auto-repair with Gemini on error", value=True)
 
     if st.button("Generate & Run", type="primary"):
+        snapshot = build_data_snapshot(df2, head_rows=int(head_rows), max_chars=int(max_chars)) if share_snapshot else {
+            "shape": {"rows": int(df2.shape[0]), "cols": int(df2.shape[1])},
+            "columns": list(df2.columns)
+        }
+
         # 1) First attempt
         with st.spinner("Asking Gemini…"):
-            code_v1 = llm_generate_code(user_prompt, df2)
+            code_v1 = llm_generate_code(user_prompt, df2, snapshot)
         st.subheader("Generated code (v1)")
         st.code(code_v1 or "# empty", language="python")
 
@@ -289,7 +367,7 @@ if df2 is not None:
         failed = logs.startswith("Execution error:")
         if auto_repair and failed:
             with st.spinner("Repairing with Gemini…"):
-                code_v2 = llm_repair_code(code_v1, logs, df2) or ""
+                code_v2 = llm_repair_code(code_v1, logs, df2, snapshot) or ""
             st.subheader("Repaired code (v2)")
             st.code(code_v2 or "# empty", language="python")
             with st.spinner("Executing v2…"):
@@ -300,7 +378,7 @@ if df2 is not None:
             if fig2 is not None:
                 st.pyplot(fig2, use_container_width=False, clear_figure=True)
 
-    # ===== Compact forecast preview (built-in) =====
+    # ===== Compact built-in forecast preview (optional) =====
     mrev = monthly_revenue(df2)
     if len(mrev) >= 12:
         st.markdown("### 🔮 Forecast Preview")
