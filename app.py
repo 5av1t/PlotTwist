@@ -1,4 +1,4 @@
-import os, io, json, ast, traceback, re
+import os, io, json, ast, traceback, re, zipfile
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -7,20 +7,18 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import google.generativeai as genai
 import requests
-
-# Forecasting / analytics helpers available to LLM code (preloaded; LLM must not import them)
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
 from sklearn.linear_model import LinearRegression
 import datetime
 
-# ================== APP CONFIG ==================
+# ================== CONFIG ==================
 st.set_page_config(page_title="PlotTwist — Sales Analytics Copilot", page_icon="📊", layout="wide")
 MODEL_NAME = "gemini-1.5-flash"
-RAW_XLSX_URL = "https://github.com/5av1t/PlotTwist/blob/b10bf12045e5a2e29db17b55c3d9cb6499b3727f/sales_template.xlsx"  
+FIG_W, FIG_H = 3.5, 2.4
 
-# Unified chart size (smaller & consistent)
-FIG_W = 5.5
-FIG_H = 3.2
+# Template file URLs (replace with your GitHub RAW URLs after upload)
+RAW_XLSX_URL = "https://raw.githubusercontent.com/Sav1t/plottwist/main/sales_template.xlsx"
+RAW_CSV_URL = "https://raw.githubusercontent.com/Sav1t/plottwist/main/sales_template.csv"
 
 API_KEY = os.getenv("GOOGLE_API_KEY")
 if "GOOGLE_API_KEY" in st.secrets:
@@ -28,25 +26,19 @@ if "GOOGLE_API_KEY" in st.secrets:
 if API_KEY:
     genai.configure(api_key=API_KEY)
 
-# ---------- Helpers: formatting ----------
-def fmt_currency(x):  # compact currency
-    try:
-        x = float(x)
-    except Exception:
-        return "—"
-    if abs(x) >= 1_000_000:
-        return f"${x/1_000_000:.1f}M"
-    if abs(x) >= 1_000:
-        return f"${x/1_000:.1f}K"
+# ---------- Format helpers ----------
+def fmt_currency(x):
+    try: x = float(x)
+    except Exception: return "—"
+    if abs(x) >= 1_000_000: return f"${x/1_000_000:.1f}M"
+    if abs(x) >= 1_000:     return f"${x/1_000:.1f}K"
     return f"${x:,.0f}"
 
 def fmt_percent(x):
-    try:
-        return f"{float(x):.1f}%"
-    except Exception:
-        return "—"
+    try: return f"{float(x):.1f}%"
+    except Exception: return "—"
 
-# ---------- JSON SAFE SERIALIZER ----------
+# ---------- JSON-safe serializer ----------
 def _to_jsonable(x):
     if isinstance(x, (pd.Timestamp, datetime.datetime, datetime.date)):
         return x.isoformat()
@@ -55,7 +47,7 @@ def _to_jsonable(x):
     if isinstance(x, (np.bool_,)):     return bool(x)
     return x
 
-def _sample_rows_json(df: pd.DataFrame, n: int = 3):
+def _sample_rows_json(df, n=3):
     if df.empty: return []
     return df.head(n).applymap(_to_jsonable).to_dict(orient="records")
 
@@ -67,18 +59,14 @@ Constraints:
 - DataFrame is preloaded as `df`.
 - Allowed: pandas as pd, numpy as np, matplotlib.pyplot as plt.
 - Forbidden: imports, file I/O, network, os/sys/subprocess/pathlib/socket/pickle/tempfile, input(), exec/eval/compile, __import__.
-- For forecasting/analytics, you already have:
-  • ExponentialSmoothing (from statsmodels.tsa.holtwinters)
-  • LinearRegression (from sklearn.linear_model)
-  • datetime
+- For forecasting, you already have ExponentialSmoothing, LinearRegression, datetime.
 - Do NOT import these, just use them directly.
-- If you produce a table, assign to `result_df`.
-- If you produce a chart, assign to `fig = plt.gcf()`.
-- Prefer trend-only ExponentialSmoothing unless dataset has ≥24 months for seasonal models.
+- Assign tables to `result_df`, charts to `fig = plt.gcf()`.
+- Prefer trend-only ExponentialSmoothing unless ≥24 months of data.
 - Keep code under 120 lines.
 """
 
-def llm_generate_code(user_instruction: str, df: pd.DataFrame) -> str:
+def llm_generate_code(user_instruction, df):
     if not API_KEY:
         return "# ERROR: Missing GOOGLE_API_KEY.\nresult_df = df.head(5)"
     schema = {
@@ -86,14 +74,8 @@ def llm_generate_code(user_instruction: str, df: pd.DataFrame) -> str:
         "dtypes": {c: str(df[c].dtype) for c in df.columns},
         "sample_rows": _sample_rows_json(df, 3),
     }
-    prompt = (
-        SYSTEM_PREAMBLE
-        + "\nDataFrame schema (JSON):\n"
-        + json.dumps(schema, indent=2)
-        + "\n\nUser request:\n"
-        + (user_instruction or "")
-        + "\n\n# Python code only below:\n"
-    )
+    prompt = SYSTEM_PREAMBLE + "\nSchema:\n" + json.dumps(schema, indent=2) \
+             + "\n\nUser request:\n" + (user_instruction or "") + "\n\n# Python code only:\n"
     try:
         model = genai.GenerativeModel(MODEL_NAME)
         resp = model.generate_content(prompt)
@@ -105,348 +87,162 @@ def llm_generate_code(user_instruction: str, df: pd.DataFrame) -> str:
     except Exception as e:
         return f"# ERROR calling Google AI: {e}\nresult_df = df.head(5)"
 
-# ================== CODE SANITIZER & SANDBOX ==================
+# ================== UPLOAD READER (robust for mobile) ==================
+def read_any_table(uploaded):
+    if uploaded is None:
+        raise ValueError("No file provided")
+    uploaded.seek(0)
+    raw = uploaded.read()
+    uploaded.seek(0)
+    name = (uploaded.name or "").lower()
+
+    def try_csv(b):
+        for enc in ("utf-8", "utf-8-sig", "latin-1"):
+            try: return pd.read_csv(io.StringIO(b.decode(enc)), on_bad_lines="skip")
+            except Exception: continue
+        return pd.read_csv(io.BytesIO(b), on_bad_lines="skip")
+
+    if name.endswith(".xlsx") and raw[:2] == b"PK":
+        return pd.read_excel(io.BytesIO(raw), engine="openpyxl")
+    if name.endswith(".xlsx") and raw[:2] != b"PK":
+        try: return try_csv(raw)
+        except Exception: pass
+        raise ValueError("This .xlsx isn’t a valid Excel file. Try CSV instead.")
+    return try_csv(raw)
+
+# ================== SANDBOX ==================
 IMPORT_LINE_RE = re.compile(r'^\s*(?:from\s+\S+\s+import\s+.*|import\s+.+)$')
 CONTINUATION_RE = re.compile(r'.*\\\s*$')
-
-def sanitize_code(snippet: str) -> str:
+def sanitize_code(snippet):
     if not isinstance(snippet, str): return ""
     code = snippet.strip()
     if code.startswith("```"):
         code = "\n".join(ln for ln in code.splitlines() if not ln.strip().startswith("```") and not ln.strip().startswith("python"))
-    cleaned_lines, skip_cont = [], False
+    cleaned, skip = [], False
     for ln in code.splitlines():
-        if skip_cont:
+        if skip: 
             if CONTINUATION_RE.match(ln): continue
-            else: skip_cont = False; continue
+            else: skip = False; continue
         if IMPORT_LINE_RE.match(ln):
-            if CONTINUATION_RE.match(ln): skip_cont = True
+            if CONTINUATION_RE.match(ln): skip = True
             continue
-        cleaned_lines.append(ln)
-    return "\n".join(cleaned_lines)
+        cleaned.append(ln)
+    return "\n".join(cleaned)
 
 FORBIDDEN_CALLS = {"open","exec","eval","compile","__import__","input","system"}
 FORBIDDEN_ATTR_ROOTS = {"os","sys","subprocess","pathlib","socket","requests","shutil","pickle","dill","tempfile","builtins","importlib"}
 FORBIDDEN_NODES = (ast.Import, ast.ImportFrom)
 DISALLOWED_ATTR_NAMES = {"__dict__","__class__","__mro__","__subclasses__","__globals__","__getattribute__","__getattr__"}
 
-def validate_snippet(snippet: str):
-    try:
-        tree = ast.parse(snippet)
-    except Exception as e:
-        return False, f"Code not parsable: {e}"
-
+def validate_snippet(snippet):
+    try: tree = ast.parse(snippet)
+    except Exception as e: return False, f"Code not parsable: {e}"
     class Guard(ast.NodeVisitor):
         def visit(self, node):
-            if isinstance(node, FORBIDDEN_NODES):
-                raise ValueError(f"Forbidden node: {type(node).__name__}")
+            if isinstance(node, FORBIDDEN_NODES): raise ValueError(f"Forbidden node: {type(node).__name__}")
             return super().visit(node)
-        def visit_Call(self, node: ast.Call):
+        def visit_Call(self, node):
             if isinstance(node.func, ast.Name) and node.func.id in FORBIDDEN_CALLS:
                 raise ValueError(f"Forbidden call: {node.func.id}()")
             self.generic_visit(node)
-        def visit_Attribute(self, node: ast.Attribute):
-            if node.attr in DISALLOWED_ATTR_NAMES:
-                raise ValueError(f"Forbidden attribute access: {node.attr}")
+        def visit_Attribute(self, node):
+            if node.attr in DISALLOWED_ATTR_NAMES: raise ValueError(f"Forbidden attribute: {node.attr}")
             base = node
             while isinstance(base, ast.Attribute): base = base.value
             if isinstance(base, ast.Name) and base.id in FORBIDDEN_ATTR_ROOTS:
                 raise ValueError(f"Forbidden module usage: {base.id}.*")
             self.generic_visit(node)
-    try:
-        Guard().visit(tree)
-    except ValueError as ve:
-        return False, str(ve)
+    try: Guard().visit(tree)
+    except ValueError as ve: return False, str(ve)
     return True, None
 
-def run_snippet(snippet: str, df: pd.DataFrame):
+def run_snippet(snippet, df):
     cleaned = sanitize_code(snippet)
     ok, err = validate_snippet(cleaned)
-    if not ok:
-        return None, None, f"Validation failed: {err}"
-    safe_globals = {
-        "pd": pd, "np": np, "plt": plt,
+    if not ok: return None, None, f"Validation failed: {err}"
+    safe_globals = {"pd": pd, "np": np, "plt": plt,
         "ExponentialSmoothing": ExponentialSmoothing,
         "LinearRegression": LinearRegression,
-        "datetime": datetime
-    }
+        "datetime": datetime}
     safe_locals = {"df": df.copy()}
     try:
         exec(cleaned, safe_globals, safe_locals)
         result_df = safe_locals.get("result_df")
         fig = safe_locals.get("fig", plt.gcf())
         if fig and not fig.axes: fig = None
-        return result_df, fig, "Executed successfully (imports stripped)."
+        return result_df, fig, "Executed OK"
     except Exception as e:
-        msg = "".join(traceback.format_exception_only(type(e), e))
-        if "initial seasonals" in msg:
-            try:
-                alt = cleaned.replace("seasonal=\"add\"", "").replace("seasonal='add'", "")
-                exec(alt, safe_globals, safe_locals)
-                result_df = safe_locals.get("result_df")
-                fig = safe_locals.get("fig", plt.gcf())
-                if fig and not fig.axes: fig = None
-                return result_df, fig, "Executed with fallback: removed seasonal component."
-            except Exception as e2:
-                return None, None, "Execution error after fallback:\n" + "".join(traceback.format_exception_only(type(e2), e2))
-        return None, None, "Execution error:\n" + msg
-
-# ================== TEMPLATE (FALLBACK) ==================
-TEMPLATE_COLUMNS = ["OrderID","OrderDate","Week","Customer","Product","Category","Region","Quantity","UnitPrice","Revenue"]
-
-def build_fallback_template_df() -> pd.DataFrame:
-    rows, order_id = [], 40001
-    customers = ["Acme Corp","Beta LLC","Delta Inc","Echo Ltd"]
-    products  = [("Widget A","Widgets",15),("Widget B","Widgets",19),("Gizmo X","Gizmos",45),("Gizmo Y","Gizmos",60)]
-    regions   = ["North","South","East","West"]
-    for m in range(1,13):
-        for i in range(3):
-            cust = customers[(m+i)%len(customers)]
-            prod, cat, price = products[(m+i)%len(products)]
-            reg  = regions[(m+i)%len(regions)]
-            qty  = 5+((m+i)%20)
-            date = pd.Timestamp(year=2024,month=m,day=min(5+i*7,28))
-            week = int(pd.Timestamp(date).isocalendar().week)
-            revenue = qty*price
-            rows.append([order_id,date.date().isoformat(),week,cust,prod,cat,reg,qty,float(price),float(revenue)])
-            order_id+=1
-    return pd.DataFrame(rows,columns=TEMPLATE_COLUMNS)
-
-def dataframe_to_excel_bytes(df: pd.DataFrame, sheet_name="Sales") -> bytes:
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf,engine="openpyxl") as writer:
-        df.to_excel(writer,index=False,sheet_name=sheet_name)
-    buf.seek(0)
-    return buf.read()
-
-# ================== SIDEBAR: DOWNLOAD TEMPLATE ==================
-with st.sidebar:
-    st.header("⬇️ Download Sales Template (Excel)")
-    st.caption("Dummy dataset (12 months). Upload it back or use your own.")
-    xlsx_bytes=None
-    if RAW_XLSX_URL.startswith("http"):
-        try:
-            r=requests.get(RAW_XLSX_URL,timeout=12); r.raise_for_status(); xlsx_bytes=r.content
-        except: pass
-    if xlsx_bytes:
-        st.download_button("Download sales_template.xlsx",data=xlsx_bytes,file_name="sales_template.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-    else:
-        fallback=dataframe_to_excel_bytes(build_fallback_template_df())
-        st.download_button("Download fallback_template.xlsx",data=fallback,file_name="fallback_template.xlsx",
-                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        return None, None, "Execution error:\n" + "".join(traceback.format_exception_only(type(e), e))
 
 # ================== AUTO-INSIGHTS HELPERS ==================
-def ensure_dates_and_revenue(df: pd.DataFrame) -> pd.DataFrame:
+def ensure_dates_and_revenue(df):
     out = df.copy()
-    # Date column
-    if "OrderDate" in out.columns:
-        out["OrderDate"] = pd.to_datetime(out["OrderDate"], errors="coerce")
-    elif "Date" in out.columns:
-        out["OrderDate"] = pd.to_datetime(out["Date"], errors="coerce")
+    if "OrderDate" in out.columns: out["OrderDate"] = pd.to_datetime(out["OrderDate"], errors="coerce")
+    elif "Date" in out.columns: out["OrderDate"] = pd.to_datetime(out["Date"], errors="coerce")
     else:
         for c in out.columns:
-            try:
-                cand = pd.to_datetime(out[c], errors="raise")
-                out["OrderDate"] = cand; break
-            except Exception:
-                continue
-        if "OrderDate" not in out.columns:
-            out["OrderDate"] = pd.NaT
-    # Revenue
+            try: out["OrderDate"] = pd.to_datetime(out[c], errors="raise"); break
+            except Exception: continue
     if "Revenue" not in out.columns:
         if {"Quantity","UnitPrice"}.issubset(out.columns):
             out["Revenue"] = pd.to_numeric(out["Quantity"], errors="coerce") * pd.to_numeric(out["UnitPrice"], errors="coerce")
-        else:
-            out["Revenue"] = np.nan
+        else: out["Revenue"] = np.nan
     return out
 
-def kpis(df: pd.DataFrame):
-    total_rev = pd.to_numeric(df["Revenue"], errors="coerce").sum(skipna=True)
-    orders = len(df)
-    aov = (total_rev / orders) if orders else 0.0
-    top_cust = df.groupby("Customer")["Revenue"].sum().sort_values(ascending=False).head(1)
-    top_prod = df.groupby("Product")["Revenue"].sum().sort_values(ascending=False).head(1)
-    return {
-        "total_revenue": float(total_rev) if pd.notna(total_rev) else 0.0,
-        "aov": float(aov) if pd.notna(aov) else 0.0,
-        "top_customer": (top_cust.index[0], float(top_cust.iloc[0])) if len(top_cust) else ("—", 0.0),
-        "top_product": (top_prod.index[0], float(top_prod.iloc[0])) if len(top_prod) else ("—", 0.0),
-    }
+def monthly_revenue(df): return df.dropna(subset=["OrderDate"]).set_index("OrderDate")["Revenue"].resample("MS").sum().to_frame()
 
-def monthly_revenue(df: pd.DataFrame) -> pd.DataFrame:
-    s = df.dropna(subset=["OrderDate"]).set_index("OrderDate")["Revenue"]
-    return s.resample("MS").sum().rename("Revenue").to_frame()
+# ================== SIDEBAR ==================
+with st.sidebar:
+    st.header("⬇️ Download Sales Templates")
+    st.caption("Use these clean templates (5 years of data).")
+    try:
+        rx = requests.get(RAW_XLSX_URL, timeout=8); rx.raise_for_status()
+        st.download_button("Download Excel (.xlsx)", data=rx.content, file_name="sales_template.xlsx",
+                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    except Exception: st.warning("Excel template not available")
 
-def yoy_growth(mrev: pd.DataFrame) -> float | None:
-    if len(mrev) < 24: return None
-    last12  = mrev["Revenue"].iloc[-12:].sum()
-    prev12  = mrev["Revenue"].iloc[-24:-12].sum()
-    if prev12 == 0: return None
-    return float((last12 - prev12) / prev12 * 100.0)
-
-def quick_forecast(mrev: pd.DataFrame, horizon=6):
-    """Returns (forecast_series, model_label, resid_std)"""
-    y = mrev["Revenue"].astype(float)
-    label = ""
-    if len(mrev) >= 24:
-        try:
-            model = ExponentialSmoothing(y, trend="add", seasonal="add", seasonal_periods=12).fit()
-            label = "ETS Additive (trend+seasonal)"
-        except Exception:
-            model = ExponentialSmoothing(y, trend="add").fit()
-            label = "ETS Additive (trend-only fallback)"
-    else:
-        model = ExponentialSmoothing(y, trend="add").fit()
-        label = "ETS Additive (trend-only)"
-    fcast = model.forecast(horizon)
-    # crude PI using residual std dev
-    resid = y - model.fittedvalues.reindex(y.index).fillna(method="bfill")
-    resid_std = float(np.nanstd(resid))
-    idx = pd.date_range(start=mrev.index[-1] + pd.offsets.MonthBegin(1), periods=horizon, freq="MS")
-    fcast.index = idx
-    return fcast, label, resid_std
+    try:
+        rc = requests.get(RAW_CSV_URL, timeout=8); rc.raise_for_status()
+        st.download_button("Download CSV (.csv)", data=rc.content, file_name="sales_template.csv", mime="text/csv")
+    except Exception: st.warning("CSV template not available")
 
 # ================== MAIN UI ==================
 st.title("📊 PlotTwist — Sales Analytics Copilot")
-st.caption("Upload Excel → Instant insights + tidy charts → Click a prompt chip or ask your own → Gemini generates code → Safe run.")
+st.caption("Upload Excel/CSV → Gemini generates insights → Compact KPIs + charts.")
 
-file = st.file_uploader("Upload sales file (.xlsx preferred, .csv accepted)", type=["xlsx","csv"])
-df = None
+file = st.file_uploader("Upload sales file (.xlsx or .csv)", type=["xlsx","csv"])
+df2 = None
 if file:
     try:
-        if file.name.lower().endswith(".xlsx"):
-            df = pd.read_excel(file, engine="openpyxl")
-        else:
-            df = pd.read_csv(file, on_bad_lines="skip")
-        st.success(f"Loaded {len(df):,} rows × {len(df.columns)} cols")
-        st.dataframe(df.head(30), use_container_width=True)
+        df2 = ensure_dates_and_revenue(read_any_table(file))
+        st.success(f"Loaded {len(df2):,} rows × {len(df2.columns)} cols")
+        st.dataframe(df2.head(20), use_container_width=True)
     except Exception as e:
         st.error(f"Failed to read file: {e}")
 
-# ======= WOW MOMENT: Compact KPIs + Narrative + Smaller Charts =======
-if df is not None:
-    df2 = ensure_dates_and_revenue(df)
-    mrev = monthly_revenue(df2)
-
-    # KPI cards (compact & formatted)
-    c1, c2, c3, c4, c5 = st.columns([1,1,1,1,1])
-    k = kpis(df2)
-    c1.metric("Total Revenue", fmt_currency(k['total_revenue']))
-    c2.metric("Avg Order Value", fmt_currency(k['aov']))
-    c3.metric("Top Customer", k['top_customer'][0], fmt_currency(k['top_customer'][1]))
-    c4.metric("Top Product", k['top_product'][0], fmt_currency(k['top_product'][1]))
-    yg = yoy_growth(mrev)
-    c5.metric("YoY Growth (L12 vs P12)", fmt_percent(yg) if yg is not None else "—")
-
-    # Narrative summary
-    st.markdown(
-        f"**Summary:** In the latest period, total revenue is **{fmt_currency(k['total_revenue'])}** "
-        f"with an average order value of **{fmt_currency(k['aov'])}**. "
-        f"Top customer is **{k['top_customer'][0]}** and top product is **{k['top_product'][0]}**."
-        + (f" Year-over-year growth is **{fmt_percent(yg)}**." if yg is not None else "")
+# ====== GEMINI FIRST ======
+if df2 is not None:
+    st.markdown("### 🤖 Gemini — Automated Analysis")
+    default_prompt = (
+        "Summarize the dataset with 1) monthly revenue trend (compact line), "
+        "2) top 5 customers (bar), 3) total revenue + avg order value table, "
+        "and if >=24 months, forecast next 6 months with ExponentialSmoothing."
     )
-
-    # Chart grid — smaller figures, tidy layout
-    st.markdown("### Quick Charts")
-    colA, colB = st.columns(2)
-    with colA:
-        fig1, ax1 = plt.subplots(figsize=(FIG_W, FIG_H))
-        if not mrev.empty:
-            mrev.plot(ax=ax1, legend=False)
-            ax1.set_title("Monthly Revenue", fontsize=14, pad=8)
-            ax1.set_ylabel("Revenue")
-            ax1.grid(alpha=0.2)
-        fig1.tight_layout()
-        st.pyplot(fig1, clear_figure=True)
-
-    with colB:
-        fig2, ax2 = plt.subplots(figsize=(FIG_W, FIG_H))
-        if "Customer" in df2.columns:
-            top_c = df2.groupby("Customer")["Revenue"].sum().sort_values(ascending=False).head(5)
-            top_c.plot.bar(ax=ax2)
-            ax2.set_title("Top 5 Customers by Revenue", fontsize=14, pad=8)
-            ax2.set_ylabel("Revenue"); ax2.set_xlabel("")
-            ax2.grid(axis="y", alpha=0.2)
-        fig2.tight_layout()
-        st.pyplot(fig2, clear_figure=True)
-
-    colC, colD = st.columns(2)
-    with colC:
-        fig3, ax3 = plt.subplots(figsize=(FIG_W, FIG_H))
-        if "Category" in df2.columns:
-            mix = df2.groupby("Category")["Revenue"].sum()
-            if len(mix) > 0:
-                ax3.pie(mix.values, labels=mix.index, autopct="%1.0f%%", pctdistance=0.8)
-                ax3.set_title("Product Mix by Revenue", fontsize=14, pad=8)
-        fig3.tight_layout()
-        st.pyplot(fig3, clear_figure=True)
-
-    with colD:
-        fig4, ax4 = plt.subplots(figsize=(FIG_W, FIG_H))
-        if {"Region","OrderDate","Revenue"}.issubset(df2.columns):
-            heat = df2.copy()
-            heat["Month"] = pd.to_datetime(heat["OrderDate"]).dt.to_period("M").astype(str)
-            pv = heat.pivot_table(index="Region", columns="Month", values="Revenue", aggfunc="sum").fillna(0.0)
-            im = ax4.imshow(pv.values, aspect="auto")
-            ax4.set_yticks(range(len(pv.index))); ax4.set_yticklabels(pv.index)
-            ax4.set_xticks(range(len(pv.columns))); ax4.set_xticklabels(pv.columns, rotation=45, ha="right", fontsize=8)
-            ax4.set_title("Region × Month Heatmap (Revenue)", fontsize=14, pad=8)
-            fig4.colorbar(im, ax=ax4, shrink=0.85)
-        fig4.tight_layout()
-        st.pyplot(fig4, clear_figure=True)
-
-    # Compact forecast preview with band (only if we have ≥ 12 months; seasonal if ≥ 24)
-    if len(mrev) >= 12:
-        st.markdown("### 🔮 Forecast Preview")
-        figF, axF = plt.subplots(figsize=(FIG_W*1.05, FIG_H))
-        fcast, label, resid_std = quick_forecast(mrev, horizon=6)
-        mrev["Revenue"].plot(ax=axF, label="History")
-        fcast.plot(ax=axF, style="--", label="Forecast")
-        # simple ~95% band
-        axF.fill_between(fcast.index, fcast - 1.96*resid_std, fcast + 1.96*resid_std, alpha=0.2)
-        axF.set_title("Revenue Forecast (next 6 months)", fontsize=14, pad=8)
-        axF.set_ylabel("Revenue"); axF.grid(alpha=0.2); axF.legend()
-        figF.tight_layout()
-        st.pyplot(figF, clear_figure=True)
-        st.caption(f"*Model used: {label}*")
-
-    st.markdown("---")
-
-# ======= PROMPT CHIPS + GEMINI RUN =======
-if df is not None:
-    st.markdown("### Ask a question or try a suggestion")
-    suggestions = [
-        "Show monthly revenue trend with a clean line chart.",
-        "Top 10 customers by total revenue as a bar chart.",
-        "Revenue by region as a sorted bar chart.",
-        "Forecast next 12 months of revenue using ExponentialSmoothing.",
-        "Scatterplot of Quantity vs Revenue with a regression line.",
-        "Category-wise monthly revenue stacked area chart."
-    ]
-    chip_cols = st.columns(len(suggestions))
-    chosen = None
-    for i, s in enumerate(suggestions):
-        if chip_cols[i].button(s, use_container_width=True):
-            chosen = s
-
-    default_text = chosen or st.session_state.get("last_prompt", "")
-    user_prompt = st.text_area("Your prompt", value=default_text, height=100, key="prompt_box")
-
-    run_now = st.button("Generate & Run", type="primary") or (chosen is not None)
+    if "ran_auto" not in st.session_state: st.session_state["ran_auto"] = False
+    user_prompt = st.text_area("Your prompt", value=st.session_state.get("last_prompt", default_prompt), height=90)
+    run_now = st.button("Generate & Run", type="primary") or (not st.session_state["ran_auto"])
     if run_now:
         st.session_state["last_prompt"] = user_prompt
         with st.spinner("Asking Gemini…"):
-            code = llm_generate_code(user_prompt, ensure_dates_and_revenue(df))
-        st.subheader("Sanitized code (imports auto-removed)")
+            code = llm_generate_code(user_prompt, df2)
+        st.subheader("Sanitized code (imports removed)")
         st.code(sanitize_code(code) if code else "# empty", language="python")
         if code and not code.strip().startswith("# ERROR"):
             with st.spinner("Executing safely…"):
-                result_df, fig, logs = run_snippet(code, ensure_dates_and_revenue(df))
+                result_df, fig, logs = run_snippet(code, df2)
             st.markdown(f"**Logs:** {logs}")
-            if isinstance(result_df, pd.DataFrame):
-                st.subheader("Result table"); st.dataframe(result_df, use_container_width=True)
-            if fig is not None:
-                st.subheader("Chart"); st.pyplot(fig, clear_figure=True)
+            if isinstance(result_df, pd.DataFrame): st.dataframe(result_df, use_container_width=True)
+            if fig is not None: st.pyplot(fig, use_container_width=False, clear_figure=True)
+        st.session_state["ran_auto"] = True
 else:
-    st.info("💡 Tip: download the Excel template from the sidebar and try prompts right away.")
+    st.info("💡 Tip: Download a template from the sidebar and try again.")
