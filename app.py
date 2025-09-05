@@ -296,7 +296,7 @@ def monthly_revenue(df):
 
 # ================== SIDEBAR ==================
 with st.sidebar:
-    st.header("⬇️ Templates")
+    st.header("Templates")
     st.caption("Use RAW links from your repo for clean downloads.")
     try:
         rx = requests.get(RAW_XLSX_URL, timeout=8); rx.raise_for_status()
@@ -311,7 +311,7 @@ with st.sidebar:
         st.warning("CSV template not available")
 
     st.divider()
-    st.header("🔎 Gemini Data Access")
+    st.header("Gemini Data Access")
     share_snapshot = st.checkbox("Share a snapshot of the uploaded file with Gemini", value=True,
                                  help="Includes schema, stats, top values, and CSV head in the LLM prompt.")
     head_rows = st.number_input("Rows to include in CSV head", 5, 200, 30, step=5)
@@ -332,7 +332,7 @@ if file:
         st.error(f"Failed to read file: {e}")
 
 if df2 is not None:
-    st.markdown("### 🤖 Ask Gemini")
+    st.markdown("Ask Gemini")
     default_prompt = (
         "Create a concise, executive-ready analysis: "
         "1) monthly revenue line (small), "
@@ -409,4 +409,4 @@ if df2 is not None:
         st.pyplot(figF, use_container_width=False, clear_figure=True)
         st.caption(f"*Model used: {label}*")
 else:
-    st.info("💡 Tip: Download a template from the sidebar and try again.")
+    st.info("Tip: Download a template from the sidebar and try again.")
