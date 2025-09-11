@@ -1,4 +1,4 @@
-import os, io, json, re
+import os, io, json, traceback, re
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -6,34 +6,74 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
-import requests
-import datetime
-from datetime import timedelta
 import google.generativeai as genai
+import requests
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from sklearn.linear_model import LinearRegression
+import datetime
+from datetime import timedelta  # exposed for LLM code
 
 # ================== CONFIG ==================
-st.set_page_config(page_title="PlotTwist — One-Click Monthly Review", page_icon="📊", layout="wide")
-FIG_W, FIG_H = 3.6, 2.5
+st.set_page_config(page_title="PlotTwist — Data-Aware & Self-Healing", page_icon="📊", layout="wide")
+MODEL_NAME = "gemini-1.5-flash"
+FIG_W, FIG_H = 3.5, 2.4
 
-# 👉 Update this to your repo’s raw CSV once committed
-RAW_CSV_URL = "https://raw.githubusercontent.com/5av1t/PlotTwist/test1/sales_template.csv"
+# 👉 UPDATE THIS to the raw CSV in your GitHub repo (keeps upload optional)
+RAW_CSV_URL  = "https://raw.githubusercontent.com/5av1t/test1/main/sales_template.csv"
+RAW_XLSX_URL = "https://raw.githubusercontent.com/5av1t/test1/main/sales_template.xlsx"  # optional template
 
-# Gemini key (optional; app still works without it)
+# Gemini key (optional; app still works without it for non-LLM flows)
 API_KEY = os.getenv("GOOGLE_API_KEY") or st.secrets.get("GOOGLE_API_KEY", None)
 if API_KEY:
     genai.configure(api_key=API_KEY)
-MODEL_NAME = "gemini-1.5-flash"
 
-# ================== DATE-SAFE PLOTTING HELPERS ==================
+# ================== SHIMS / HELPERS ==================
+def register_matplotlib_converters():
+    """No-op shim for legacy code snippets that call this."""
+    return None
+
+def fmt_currency(x):
+    try: x = float(x)
+    except Exception: return "—"
+    if abs(x) >= 1_000_000: return f"${x/1_000_000:.1f}M"
+    if abs(x) >= 1_000:     return f"${x/1_000:.1f}K"
+    return f"${x:,.0f}"
+
+def fmt_percent(x):
+    try: return f"{float(x):.1f}%"
+    except Exception: return "—"
+
+def _to_jsonable(x):
+    if isinstance(x, (pd.Timestamp, datetime.datetime, datetime.date)):
+        return x.isoformat()
+    if isinstance(x, (np.integer,)):   return int(x)
+    if isinstance(x, (np.floating,)):  return float(x)
+    if isinstance(x, (np.bool_,)):     return bool(x)
+    return x
+
+def _sample_rows_json(df, n=3):
+    if df.empty: return []
+    return df.head(n).applymap(_to_jsonable).to_dict(orient="records")
+
+# ----- Date-safe plotting + tick helpers -----
 def plot_datetime(ax, x_like, y_vals, **kwargs):
+    """Plot with a guaranteed date x-axis to avoid categorical UnitData issues."""
     xd = pd.to_datetime(x_like, errors="coerce")
     xnum = mdates.date2num(pd.DatetimeIndex(xd).to_pydatetime())
     line = ax.plot(xnum, np.asarray(y_vals, dtype=float), **kwargs)
     ax.xaxis_date()
-    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
     return line
 
+def fill_between_datetime(ax, x_like, y1, y2, **kwargs):
+    xd = pd.to_datetime(x_like, errors="coerce")
+    xnum = mdates.date2num(pd.DatetimeIndex(xd).to_pydatetime())
+    ax.fill_between(xnum, np.asarray(y1, dtype=float), np.asarray(y2, dtype=float), **kwargs)
+    ax.xaxis_date()
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m"))
+
 def set_tick_label_alignment(ax, axis="x", rotation=0, ha="center"):
+    """Safely set rotation + horizontal alignment on tick labels."""
     if axis in ("x", "both"):
         for lbl in ax.get_xticklabels():
             lbl.set_rotation(rotation)
@@ -46,248 +86,368 @@ def set_tick_label_alignment(ax, axis="x", rotation=0, ha="center"):
 # ================== DATA LOADING ==================
 def read_csv_from_repo(raw_url: str) -> pd.DataFrame:
     # Try remote raw URL first
-    try:
-        r = requests.get(raw_url, timeout=10)
-        r.raise_for_status()
-        return pd.read_csv(io.StringIO(r.text))
-    except Exception:
-        pass
+    if raw_url:
+        try:
+            r = requests.get(raw_url, timeout=10)
+            r.raise_for_status()
+            return pd.read_csv(io.StringIO(r.text))
+        except Exception:
+            pass
     # Fallback to local file in repo, if present
     for candidate in ["sales_template.csv", "data.csv", "sales.csv"]:
         if os.path.exists(candidate):
             return pd.read_csv(candidate)
-    raise FileNotFoundError("Could not load CSV. Update RAW_CSV_URL or add 'sales_template.csv' to the repo root.")
+    raise FileNotFoundError("Could not load CSV from repo. Update RAW_CSV_URL or add 'sales_template.csv' to repo root.")
 
-def normalize_df(df: pd.DataFrame) -> pd.DataFrame:
+def read_any_table(uploaded):
+    """Mobile-safe reader for optional user upload (xlsx or csv)."""
+    if uploaded is None:
+        raise ValueError("No file provided")
+    uploaded.seek(0)
+    raw = uploaded.read()
+    uploaded.seek(0)
+    name = (uploaded.name or "").lower()
+
+    def try_csv(b):
+        for enc in ("utf-8", "utf-8-sig", "latin-1"):
+            try: return pd.read_csv(io.StringIO(b.decode(enc)), on_bad_lines="skip")
+            except Exception: continue
+        return pd.read_csv(io.BytesIO(b), on_bad_lines="skip")
+
+    if name.endswith(".xlsx") and raw[:2] == b"PK":
+        return pd.read_excel(io.BytesIO(raw), engine="openpyxl")
+    if name.endswith(".xlsx") and raw[:2] != b"PK":
+        try: return try_csv(raw)
+        except Exception: pass
+        raise ValueError("This .xlsx isn’t a valid Excel file. Try CSV instead.")
+    return try_csv(raw)
+
+def ensure_dates_and_revenue(df):
     out = df.copy()
-    # Best-effort date column detection
-    date_col = None
-    for c in out.columns:
-        lc = c.lower()
-        if lc in ("orderdate", "date", "order_date", "invoice_date"):
-            date_col = c; break
-    if date_col is None:
-        # heuristic: first column that parses
+    # Date column
+    if "OrderDate" in out.columns:
+        out["OrderDate"] = pd.to_datetime(out["OrderDate"], errors="coerce")
+    elif "Date" in out.columns:
+        out["OrderDate"] = pd.to_datetime(out["Date"], errors="coerce")
+    else:
         for c in out.columns:
             try:
-                pd.to_datetime(out[c], errors="raise")
-                date_col = c
-                break
+                out["OrderDate"] = pd.to_datetime(out[c], errors="raise"); break
             except Exception:
                 continue
-    if date_col is None:
-        raise ValueError("No date-like column found. Include an 'OrderDate' or 'Date' column.")
-
-    out["OrderDate"] = pd.to_datetime(out[date_col], errors="coerce")
-    # Revenue detection or derivation
+    # Revenue column
     if "Revenue" not in out.columns:
-        q = next((c for c in out.columns if c.lower() in ("qty","quantity","units")), None)
-        p = next((c for c in out.columns if c.lower() in ("price","unitprice","unit_price","selling_price")), None)
-        if q and p:
-            out["Revenue"] = pd.to_numeric(out[q], errors="coerce") * pd.to_numeric(out[p], errors="coerce")
+        if {"Quantity","UnitPrice"}.issubset(out.columns):
+            out["Revenue"] = pd.to_numeric(out["Quantity"], errors="coerce") * pd.to_numeric(out["UnitPrice"], errors="coerce")
         else:
-            # fallback: try an amount column
             amt = next((c for c in out.columns if "amount" in c.lower() or "revenue" in c.lower() or "sales" in c.lower()), None)
-            if amt:
+            if amt is not None:
                 out["Revenue"] = pd.to_numeric(out[amt], errors="coerce")
             else:
-                raise ValueError("No revenue column found and cannot derive it (need Quantity & UnitPrice or an Amount column).")
-    out["Revenue"] = pd.to_numeric(out["Revenue"], errors="coerce")
+                out["Revenue"] = np.nan
+    return out
 
-    # Optional convenience columns
-    if "Customer" not in out.columns:
-        # guess a customer-like column
-        cust = next((c for c in out.columns if "customer" in c.lower() or "client" in c.lower() or "buyer" in c.lower()), None)
-        if cust: out["Customer"] = out[cust].astype(str)
-        else: out["Customer"] = "Unknown"
-    if "Product" not in out.columns:
-        prod = next((c for c in out.columns if "product" in c.lower() or "item" in c.lower() or "sku" in c.lower()), None)
-        if prod: out["Product"] = out[prod].astype(str)
-        else: out["Product"] = "Unknown"
+def monthly_revenue(df):
+    s = pd.to_datetime(df["OrderDate"], errors="coerce")
+    m = pd.Series(pd.to_numeric(df["Revenue"], errors="coerce"), index=s)
+    out = m.dropna().resample("MS").sum().to_frame(name="Revenue")
+    out.index = pd.DatetimeIndex(out.index)
+    return out
 
-    return out.dropna(subset=["OrderDate", "Revenue"])
+# ================== DATA SNAPSHOT (what Gemini sees) ==================
+def build_data_snapshot(df: pd.DataFrame, *, head_rows: int = 20, max_chars: int = 50000) -> dict:
+    """Compact summary of actual data (schema, stats, top values, head) to guide Gemini's code."""
+    snap = {}
+    nulls = df.isna().sum().to_dict()
+    dtypes = {c: str(df[c].dtype) for c in df.columns}
+    rows, cols = df.shape
+    snap["shape"] = {"rows": int(rows), "cols": int(cols)}
+    snap["columns"] = list(df.columns)
+    snap["dtypes"] = dtypes
+    snap["null_counts"] = {k: int(v) for k, v in nulls.items()}
 
-def last_month_window(tz="Asia/Kolkata"):
-    today = pd.Timestamp.now(tz=tz).normalize()
-    first_this_month = today.replace(day=1)
-    last_month_end = first_this_month - pd.Timedelta(days=1)
-    last_month_start = last_month_end.replace(day=1)
-    return last_month_start.tz_localize(None), last_month_end.tz_localize(None)
+    # Date ranges
+    date_cols = [c for c in df.columns if pd.api.types.is_datetime64_any_dtype(df[c]) or "date" in c.lower()]
+    date_info = {}
+    for c in date_cols[:3]:
+        try:
+            s = pd.to_datetime(df[c], errors="coerce")
+            if s.notna().any():
+                date_info[c] = {"min": s.min().isoformat() if pd.notna(s.min()) else None,
+                                "max": s.max().isoformat() if pd.notna(s.max()) else None}
+        except Exception:
+            pass
+    if date_info: snap["date_ranges"] = date_info
 
-# ================== KPI COMPUTATION ==================
-def compute_last_month_kpis(df: pd.DataFrame):
-    start, end = last_month_window()
-    mask_last = (df["OrderDate"] >= start) & (df["OrderDate"] <= end)
-    last_df = df.loc[mask_last].copy()
+    # Numeric stats
+    num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]
+    if num_cols:
+        desc = df[num_cols].describe().round(3).to_dict()
+        snap["numeric_describe"] = {k: {kk: _to_jsonable(vv) for kk, vv in v.items()} for k, v in desc.items()}
 
-    # previous month
-    prev_end = start - pd.Timedelta(days=1)
-    prev_start = prev_end.replace(day=1)
-    mask_prev = (df["OrderDate"] >= prev_start) & (df["OrderDate"] <= prev_end)
-    prev_df = df.loc[mask_prev].copy()
+    # Categorical top values
+    cat_cols = [c for c in df.columns if df[c].dtype == "object" or pd.api.types.is_categorical_dtype(df[c])]
+    cat_counts = {}
+    for c in cat_cols[:6]:
+        try:
+            vc = df[c].astype(str).value_counts().head(8)
+            cat_counts[c] = {str(k): int(v) for k, v in vc.items()}
+        except Exception:
+            continue
+    if cat_counts: snap["top_values"] = cat_counts
 
-    rev = float(last_df["Revenue"].sum()) if not last_df.empty else 0.0
-    orders = int(last_df.shape[0])
-    aov = float(rev / orders) if orders > 0 else 0.0
+    # CSV head (respect char budget)
+    try:
+        head_csv = df.head(head_rows).to_csv(index=False)
+        if len(head_csv) > max_chars:
+            head_csv = head_csv[:max_chars]
+        snap["csv_head"] = head_csv
+    except Exception:
+        snap["csv_head"] = ""
 
-    prev_rev = float(prev_df["Revenue"].sum()) if not prev_df.empty else 0.0
-    growth = ((rev - prev_rev) / prev_rev * 100.0) if prev_rev > 0 else np.nan
+    return snap
 
-    top_customer = last_df.groupby("Customer")["Revenue"].sum().sort_values(ascending=False).head(1)
-    top_product = last_df.groupby("Product")["Revenue"].sum().sort_values(ascending=False).head(1)
+# ================== LLM PROMPTS ==================
+BASE_RULES = """
+You are a Python data assistant. Output ONLY a Python code snippet (no backticks, no prose).
 
-    best_customer = (top_customer.index[0], float(top_customer.iloc[0])) if not top_customer.empty else ("—", 0.0)
-    best_product  = (top_product.index[0], float(top_product.iloc[0])) if not top_product.empty else ("—", 0.0)
+Data:
+- A pandas DataFrame is preloaded as `df`.
+- You are also given a DATA SNAPSHOT extracted from the real file: schema, dtypes, nulls, value counts, numeric stats, and the CSV head.
+- Your code MUST be consistent with the snapshot (column names, types, shapes).
 
-    # Daily series for chart
-    if not last_df.empty:
-        daily = last_df.set_index("OrderDate").resample("D")["Revenue"].sum().reset_index()
-    else:
-        daily = pd.DataFrame({"OrderDate": pd.date_range(start, end, freq="D"), "Revenue": 0.0})
+Charting:
+- Use pandas/numpy/matplotlib.
+- For any date x-axis, ALWAYS use:
+  • plot_datetime(ax, x, y)
+  • fill_between_datetime(ax, x, y1, y2)
+- To rotate/align tick labels, use set_tick_label_alignment(ax, axis="x", rotation=45, ha="right").
+  Do NOT pass 'ha' to tick_params (it will error).
 
-    kpis = {
-        "period": {"start": start.date().isoformat(), "end": end.date().isoformat()},
-        "revenue": rev,
-        "orders": orders,
-        "aov": aov,
-        "prev_revenue": prev_rev,
-        "growth_pct": growth,
-        "best_customer": {"name": best_customer[0], "revenue": best_customer[1]},
-        "best_product": {"name": best_product[0], "revenue": best_product[1]},
-    }
-    return kpis, daily, last_df
+Results:
+- Assign tables to `result_df` (pd.DataFrame).
+- Assign charts to `fig = plt.gcf()`.
 
-def fmt_money(x):
-    if abs(x) >= 1_000_000: return f"${x/1_000_000:.1f}M"
-    if abs(x) >= 1_000: return f"${x/1_000:.1f}K"
-    return f"${x:,.0f}"
+Forecasting:
+- You can use ExponentialSmoothing, LinearRegression, datetime, timedelta.
+- Prefer trend-only ExponentialSmoothing unless dataset has ≥24 months for seasonality.
 
-# ================== GENAI NARRATIVE ==================
-def gemini_summary(kpis: dict, samples: pd.DataFrame):
+Limits:
+- No network calls. Keep code under 120 lines. Do not touch files.
+- register_matplotlib_converters() exists but is a no-op; do not rely on it.
+"""
+
+def _remove_md_fences(text: str) -> str:
+    if not isinstance(text, str): return ""
+    if text.strip().startswith("```"):
+        lines = [ln for ln in text.splitlines() if not ln.strip().startswith("```") and not ln.strip().startswith("python")]
+        return "\n".join(lines).strip()
+    return text.strip()
+
+def llm_generate_code(user_instruction, df, snapshot: dict):
     if not API_KEY:
-        return "_Gemini summary unavailable (no GOOGLE_API_KEY set)._"
-    model = genai.GenerativeModel(MODEL_NAME)
-    brief = {
-        "period": kpis["period"],
-        "revenue": kpis["revenue"],
-        "orders": kpis["orders"],
-        "aov": kpis["aov"],
-        "prev_revenue": kpis["prev_revenue"],
-        "growth_pct": kpis["growth_pct"],
-        "best_customer": kpis["best_customer"],
-        "best_product": kpis["best_product"],
-        "sample_rows": samples.head(10).to_dict(orient="records"),
+        return "# ERROR: Missing GOOGLE_API_KEY.\nresult_df = df.head(5)"
+    schema = {
+        "columns": df.columns.tolist(),
+        "dtypes": {c: str(df[c].dtype) for c in df.columns},
+        "sample_rows": _sample_rows_json(df, 3),
     }
     prompt = (
-        "Write a crisp executive summary for the monthly sales performance below. "
-        "Explain KPIs in plain language, call out growth/decline, top customer/product, "
-        "and suggest 2–3 actions. Keep it under 120 words.\n\n"
-        + json.dumps(brief, ensure_ascii=False)
+        BASE_RULES
+        + "\n\n# DATA SNAPSHOT (JSON)\n" + json.dumps(snapshot, ensure_ascii=False)[:90000]
+        + "\n\n# LIGHT SCHEMA\n" + json.dumps(schema, ensure_ascii=False)
+        + "\n\n# USER REQUEST\n" + (user_instruction or "")
+        + "\n\n# PYTHON CODE ONLY BELOW\n"
     )
+    model = genai.GenerativeModel(MODEL_NAME)
+    resp = model.generate_content(prompt)
+    return _remove_md_fences(getattr(resp, "text", "") or "")
+
+def llm_repair_code(prev_code: str, error_text: str, df: pd.DataFrame, snapshot: dict):
+    """Ask Gemini to repair the previous code using the error + snapshot."""
+    if not API_KEY:
+        return None
+    schema = {
+        "columns": df.columns.tolist(),
+        "dtypes": {c: str(df[c].dtype) for c in df.columns},
+        "sample_rows": _sample_rows_json(df, 3),
+    }
+    repair_prompt = (
+        BASE_RULES
+        + "\nYou previously produced code that errored. Repair it using the DATA SNAPSHOT."
+        + "\nReturn only corrected Python code (no backticks, no prose)."
+        + "\n\n# PREVIOUS CODE\n" + prev_code
+        + "\n\n# ERROR\n" + error_text
+        + "\n\n# DATA SNAPSHOT (JSON)\n" + json.dumps(snapshot, ensure_ascii=False)[:90000]
+        + "\n\n# LIGHT SCHEMA\n" + json.dumps(schema, ensure_ascii=False)
+        + "\n\n# CORRECTED PYTHON CODE ONLY BELOW\n"
+    )
+    model = genai.GenerativeModel(MODEL_NAME)
+    resp = model.generate_content(repair_prompt)
+    return _remove_md_fences(getattr(resp, "text", "") or "")
+
+# ================== SANDBOX (execute LLM code) ==================
+def run_snippet(snippet: str, df: pd.DataFrame):
+    # Hard cleanup for a few common issues
+    if "tick_params(" in snippet and "ha=" in snippet:
+        snippet = re.sub(r"(tick_params\([^)]*)ha\s*=\s*['\"][^'\"]+['\"]\s*,?\s*", r"\1", snippet)
+
+    builtins_obj = __builtins__
+    builtins_dict = builtins_obj if isinstance(builtins_obj, dict) else builtins_obj.__dict__
+    safe_builtins = builtins_dict.copy()
+
+    safe_globals = {
+        "pd": pd, "np": np, "plt": plt, "mdates": mdates,
+        "ExponentialSmoothing": ExponentialSmoothing,
+        "LinearRegression": LinearRegression,
+        "datetime": datetime, "timedelta": timedelta,
+        "plot_datetime": plot_datetime,
+        "fill_between_datetime": fill_between_datetime,
+        "set_tick_label_alignment": set_tick_label_alignment,
+        "register_matplotlib_converters": register_matplotlib_converters,
+        "__builtins__": safe_builtins,
+    }
+    safe_locals = {"df": df.copy()}
     try:
-        resp = model.generate_content(prompt)
-        return (getattr(resp, "text", "") or "").strip()
+        exec(snippet, safe_globals, safe_locals)
+        result_df = safe_locals.get("result_df")
+        fig = safe_locals.get("fig", plt.gcf())
+        if fig and not fig.axes: fig = None
+        return result_df, fig, "Executed OK"
     except Exception as e:
-        return f"_Gemini error: {e}_"
+        return None, None, "Execution error:\n" + "".join(traceback.format_exception_only(type(e), e))
 
-# ================== UI ==================
-st.title("📊 PlotTwist — One-Click Monthly Review")
-st.caption("No uploads. We’ll use the CSV in your repo. Click once → KPIs, charts, and a GenAI summary.")
-
+# ================== SIDEBAR ==================
 with st.sidebar:
-    st.header("Data source")
-    st.write("Using CSV from your repo:")
-    st.code(RAW_CSV_URL or "sales_template.csv", language="text")
-    use_custom = st.toggle("Use my own file (optional)", value=False)
-    uploaded = None
-    if use_custom:
-        uploaded = st.file_uploader("Upload CSV (optional)", type=["csv"])
+    st.header("⬇️ Templates")
+    st.caption("These links pull from your GitHub repo raw URLs.")
+    if RAW_XLSX_URL:
+        try:
+            rx = requests.get(RAW_XLSX_URL, timeout=8); rx.raise_for_status()
+            st.download_button("Excel template (.xlsx)", data=rx.content, file_name="sales_template.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception:
+            st.warning("Excel template not available")
+    if RAW_CSV_URL:
+        try:
+            rc = requests.get(RAW_CSV_URL, timeout=8); rc.raise_for_status()
+            st.download_button("CSV template (.csv)", data=rc.content, file_name="sales_template.csv", mime="text/csv")
+        except Exception:
+            st.warning("CSV template not available")
 
-# Load data
+    st.divider()
+    st.header("📦 Data Source")
+    use_repo = st.toggle("Use repository CSV (recommended)", value=True)
+    share_snapshot = st.checkbox("Share a snapshot of the data with Gemini", value=True,
+                                 help="Includes schema, stats, and CSV head in the LLM prompt.")
+    head_rows = st.number_input("Rows for CSV head", 5, 200, 30, step=5)
+    max_chars = st.slider("Max snapshot characters", 5_000, 120_000, 40_000, step=5_000)
+
+    st.caption("Or use your own file (optional):")
+    uploaded_file = st.file_uploader("Upload Excel/CSV (optional)", type=["xlsx","csv"])
+
+# ================== MAIN UI ==================
+st.title("📊 PlotTwist — Sales Analytics Copilot (Data-Aware & Self-Healing)")
+st.caption("Same app as before. Now defaults to your repo CSV so users don’t need to upload. Upload remains optional.")
+
+# Load data per your preference
+df2 = None
+load_err = None
 try:
-    if use_custom and uploaded is not None:
-        df_raw = pd.read_csv(uploaded)
-    else:
+    if use_repo:
+        # Use repo CSV by default
         df_raw = read_csv_from_repo(RAW_CSV_URL)
-    df = normalize_df(df_raw)
-    st.success(f"Loaded {len(df):,} rows × {len(df.columns)} columns")
+    elif uploaded_file is not None:
+        # Use uploaded file if user opted out of repo CSV
+        if uploaded_file.name.lower().endswith(".xlsx"):
+            df_raw = read_any_table(uploaded_file)
+        else:
+            df_raw = pd.read_csv(uploaded_file)
+    else:
+        df_raw = read_csv_from_repo(RAW_CSV_URL)  # fallback to repo anyway
+    df2 = ensure_dates_and_revenue(df_raw)
+    st.success(f"Loaded {len(df2):,} rows × {len(df2.columns)} cols")
+    st.dataframe(df2.head(20), use_container_width=True)
 except Exception as e:
-    st.error(f"Failed to load data: {e}")
-    st.stop()
+    load_err = str(e)
+    st.error(f"Failed to load data: {load_err}")
 
-# Run analysis
-run = st.button("▶️ Run Last Month Analysis", type="primary")
+# ===== LLM-driven analysis (unchanged UX) =====
+if df2 is not None:
+    st.markdown("### 🤖 Ask Gemini")
+    default_prompt = (
+        "Summarize the dataset with 1) monthly revenue trend (compact line), "
+        "2) top 5 customers (bar), 3) total revenue + avg order value table, "
+        "and if ≥24 months, forecast next 6 months (same chart)."
+    )
+    auto_repair = st.checkbox("Auto-repair with Gemini on error", value=True)
+    user_prompt = st.text_area("Your prompt", value=default_prompt, height=100)
 
-if run:
-    kpis, daily, last_df = compute_last_month_kpis(df)
+    if st.button("Generate & Run", type="primary"):
+        snapshot = build_data_snapshot(df2, head_rows=int(head_rows), max_chars=int(max_chars)) if share_snapshot else {
+            "shape": {"rows": int(df2.shape[0]), "cols": int(df2.shape[1])},
+            "columns": list(df2.columns)
+        }
 
-    # — KPIs —
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Revenue (last month)", fmt_money(kpis["revenue"]))
-    c2.metric("Orders", f"{kpis['orders']:,}")
-    if np.isnan(kpis["growth_pct"]):
-        c3.metric("Growth vs prev.", "—")
-    else:
-        c3.metric("Growth vs prev.", f"{kpis['growth_pct']:.1f}%")
-    c4.metric("Avg Order Value", fmt_money(kpis["aov"]))
-    st.caption(f"Period: {kpis['period']['start']} → {kpis['period']['end']}")
+        # 1) First attempt
+        with st.spinner("Asking Gemini…"):
+            code_v1 = llm_generate_code(user_prompt, df2, snapshot)
+        st.subheader("Generated code (v1)")
+        st.code(code_v1 or "# empty", language="python")
 
-    # — Charts (compact & mobile-friendly) —
-    st.markdown("#### Revenue by Day (last month)")
-    fig1, ax1 = plt.subplots(figsize=(FIG_W, FIG_H))
-    plot_datetime(ax1, daily["OrderDate"], daily["Revenue"], marker="o", linewidth=1.5)
-    set_tick_label_alignment(ax1, "x", rotation=45, ha="right")
-    ax1.set_ylabel("Revenue")
-    ax1.grid(alpha=0.2)
-    fig1.tight_layout()
-    st.pyplot(fig1, use_container_width=False, clear_figure=True)
+        with st.spinner("Executing v1…"):
+            result_df, fig, logs = run_snippet(code_v1, df2)
+        st.markdown(f"**Logs (v1):** {logs}")
+        if isinstance(result_df, pd.DataFrame):
+            st.dataframe(result_df, use_container_width=True)
+        if fig is not None:
+            st.pyplot(fig, use_container_width=False, clear_figure=True)
 
-    # Top customer/product bars
-    st.markdown("#### Top Customer & Top Product (last month)")
-    colA, colB = st.columns(2)
-    if not last_df.empty:
-        top_cust = last_df.groupby("Customer")["Revenue"].sum().sort_values(ascending=False).head(5)
-        top_prod = last_df.groupby("Product")["Revenue"].sum().sort_values(ascending=False).head(5)
+        # 2) Auto-repair if failed
+        failed = logs.startswith("Execution error:")
+        if auto_repair and failed:
+            with st.spinner("Repairing with Gemini…"):
+                code_v2 = llm_repair_code(code_v1, logs, df2, snapshot) or ""
+            st.subheader("Repaired code (v2)")
+            st.code(code_v2 or "# empty", language="python")
+            with st.spinner("Executing v2…"):
+                result_df2, fig2, logs2 = run_snippet(code_v2, df2)
+            st.markdown(f"**Logs (v2):** {logs2}")
+            if isinstance(result_df2, pd.DataFrame):
+                st.dataframe(result_df2, use_container_width=True)
+            if fig2 is not None:
+                st.pyplot(fig2, use_container_width=False, clear_figure=True)
 
-        with colA:
-            fig2, ax2 = plt.subplots(figsize=(FIG_W, FIG_H))
-            ax2.bar(top_cust.index.astype(str), top_cust.values)
-            ax2.set_title("Top Customers")
-            ax2.set_ylabel("Revenue"); ax2.grid(axis="y", alpha=0.2)
-            ax2.tick_params(axis="x", labelrotation=30)
-            fig2.tight_layout()
-            st.pyplot(fig2, use_container_width=False, clear_figure=True)
+    # ===== Compact built-in forecast preview (unchanged) =====
+    mrev = monthly_revenue(df2)
+    if len(mrev) >= 12:
+        st.markdown("### 🔮 Forecast Preview")
+        y = mrev["Revenue"].astype(float)
+        if len(mrev) >= 24:
+            try:
+                model = ExponentialSmoothing(y, trend="add", seasonal="add", seasonal_periods=12).fit()
+                label = "ETS Additive (trend+seasonal)"
+            except Exception:
+                model = ExponentialSmoothing(y, trend="add").fit()
+                label = "ETS Additive (trend-only fallback)"
+        else:
+            model = ExponentialSmoothing(y, trend="add").fit()
+            label = "ETS Additive (trend-only)"
+        fcast = model.forecast(6)
+        resid = y - model.fittedvalues.reindex(y.index).bfill()
+        resid_std = float(np.nanstd(resid))
+        fcast.index = pd.date_range(start=mrev.index[-1] + pd.offsets.MonthBegin(1), periods=6, freq="MS")
 
-        with colB:
-            fig3, ax3 = plt.subplots(figsize=(FIG_W, FIG_H))
-            ax3.bar(top_prod.index.astype(str), top_prod.values)
-            ax3.set_title("Top Products")
-            ax3.set_ylabel("Revenue"); ax3.grid(axis="y", alpha=0.2)
-            ax3.tick_params(axis="x", labelrotation=30)
-            fig3.tight_layout()
-            st.pyplot(fig3, use_container_width=False, clear_figure=True)
-    else:
-        st.info("No transactions last month.")
-
-    # — Highlights table —
-    st.markdown("#### Highlights")
-    st.table(pd.DataFrame({
-        "Metric": ["Revenue", "Orders", "Avg Order Value", "Prev. Revenue", "Growth vs Prev.", "Best Customer", "Best Product"],
-        "Value": [
-            fmt_money(kpis["revenue"]),
-            f"{kpis['orders']:,}",
-            fmt_money(kpis["aov"]),
-            fmt_money(kpis["prev_revenue"]),
-            "—" if np.isnan(kpis["growth_pct"]) else f"{kpis['growth_pct']:.1f}%",
-            f"{kpis['best_customer']['name']} ({fmt_money(kpis['best_customer']['revenue'])})",
-            f"{kpis['best_product']['name']} ({fmt_money(kpis['best_product']['revenue'])})",
-        ]
-    }))
-
-    # — Gemini summary —
-    st.markdown("#### 🤖 Executive Summary (GenAI)")
-    summary = gemini_summary(kpis, last_df)
-    st.markdown(summary)
-
+        figF, axF = plt.subplots(figsize=(FIG_W+0.7, FIG_H))
+        plot_datetime(axF, mrev.index, y.values, label="History")
+        plot_datetime(axF, fcast.index, fcast.values, linestyle="--", label="Forecast")
+        fill_between_datetime(axF, fcast.index, (fcast - 1.96*resid_std).values, (fcast + 1.96*resid_std).values, alpha=0.2)
+        set_tick_label_alignment(axF, axis="x", rotation=45, ha="right")
+        axF.set_title("Revenue Forecast (6 mo)", fontsize=10, pad=6)
+        axF.set_ylabel("Revenue"); axF.grid(alpha=0.2); axF.legend(fontsize=8)
+        figF.tight_layout()
+        st.pyplot(figF, use_container_width=False, clear_figure=True)
+        st.caption(f"*Model used: {label}*")
 else:
-    st.info("Click **Run Last Month Analysis** to compute KPIs, charts, and the GenAI summary.")
+    if load_err is None:
+        st.info("Upload a file or enable 'Use repository CSV' in the sidebar to proceed.")
