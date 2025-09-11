@@ -19,8 +19,8 @@ MODEL_NAME = "gemini-1.5-flash"
 FIG_W, FIG_H = 3.5, 2.4
 
 # 👉 UPDATE THIS to the raw CSV in your GitHub repo (keeps upload optional)
-RAW_CSV_URL  = "https://raw.githubusercontent.com/5av1t/test1/main/sales_template.csv"
-RAW_XLSX_URL = "https://raw.githubusercontent.com/5av1t/test1/main/sales_template.xlsx"  # optional template
+RAW_CSV_URL  = "https://raw.githubusercontent.com/5av1t/PlotTwist/test1/sales_template.csv"
+RAW_XLSX_URL = "https://raw.githubusercontent.com/5av1t/PlotTwist/test1/sales_template.xlsx"  # optional template
 
 # Gemini key (optional; app still works without it for non-LLM flows)
 API_KEY = os.getenv("GOOGLE_API_KEY") or st.secrets.get("GOOGLE_API_KEY", None)
