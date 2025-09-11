@@ -339,7 +339,7 @@ with st.sidebar:
     st.header("📦 Data Source")
     use_repo = st.toggle("Use repository CSV (recommended)", value=True)
     share_snapshot = st.checkbox("Share a snapshot of the data with Gemini", value=True,
-                                 help="Includes schema, stats, and CSV head in the LLM prompt.")
+                                 help="Includes CSV head in the LLM prompt.")
     head_rows = st.number_input("Rows for CSV head", 5, 200, 30, step=5)
     max_chars = st.slider("Max snapshot characters", 5_000, 120_000, 40_000, step=5_000)
 
